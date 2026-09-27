@@ -30,7 +30,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import (
     create_engine, Column, Integer, String, Boolean, ForeignKey, DateTime, Text, Float
 )
-from sqlalchemy.orm import sessionmaker, relationship, declarative_base, Session
+from sqlalchemy import text
+from sqlalchemy.orm import sessionmaker, relationship, backref, declarative_base, Session
 from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
@@ -76,6 +77,8 @@ class Category(Base):
     name = Column(String, nullable=False)
     icon = Column(Text, default="")   # emoji ИЛИ data:image/...;base64,... (фото, загруженное админом)
     sort_order = Column(Integer, default=0)
+    parent_id = Column(Integer, ForeignKey("categories.id"), nullable=True)  # NULL = категория верхнего уровня, иначе — подкатегория
+    children = relationship("Category", backref=backref("parent", remote_side=[id]))
 
 
 class Product(Base):
@@ -116,6 +119,23 @@ class OrderItem(Base):
 
 
 Base.metadata.create_all(bind=engine)
+
+
+def _migrate_schema():
+    """Лёгкая миграция для уже существующей базы: добавляет новые колонки,
+    если их ещё нет (create_all не трогает уже созданные таблицы)."""
+    with engine.connect() as conn:
+        try:
+            if DATABASE_URL.startswith("sqlite"):
+                conn.execute(text("ALTER TABLE categories ADD COLUMN parent_id INTEGER"))
+            else:
+                conn.execute(text("ALTER TABLE categories ADD COLUMN IF NOT EXISTS parent_id INTEGER"))
+            conn.commit()
+        except Exception:
+            pass  # колонка уже существует
+
+
+_migrate_schema()
 
 
 def _seed_catalog_if_empty():
@@ -260,7 +280,12 @@ class CategoryOut(BaseModel):
     id: int
     name: str
     icon: str
+    parent_id: Optional[int] = None
     products: List[ProductOut] = []
+    subcategories: List["CategoryOut"] = []
+
+
+CategoryOut.update_forward_refs()
 
 
 class OrderItemIn(BaseModel):
@@ -310,6 +335,7 @@ class CategoryIn(BaseModel):
     name: str
     icon: str = ""
     sort_order: int = 0
+    parent_id: Optional[int] = None
 
 
 class ProductIn(BaseModel):
@@ -413,22 +439,27 @@ def me(user: User = Depends(get_current_user)):
 @app.get("/api/catalog", response_model=List[CategoryOut])
 def catalog(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     cats = db.query(Category).order_by(Category.sort_order, Category.id).all()
-    out = []
+    prods = db.query(Product).order_by(Product.sort_order, Product.id).all()
+
+    prods_by_cat: dict = {}
+    for p in prods:
+        prods_by_cat.setdefault(p.category_id, []).append(p)
+
+    cats_by_parent: dict = {}
     for c in cats:
-        prods = (
-            db.query(Product)
-            .filter(Product.category_id == c.id)
-            .order_by(Product.sort_order, Product.id)
-            .all()
-        )
-        out.append(CategoryOut(
-            id=c.id, name=c.name, icon=c.icon or "",
+        cats_by_parent.setdefault(c.parent_id, []).append(c)
+
+    def build(c: Category) -> CategoryOut:
+        return CategoryOut(
+            id=c.id, name=c.name, icon=c.icon or "", parent_id=c.parent_id,
             products=[
                 ProductOut(id=p.id, name=p.name, unit=p.unit, price=p.price, icon=p.icon or "", in_stock=p.in_stock)
-                for p in prods
+                for p in prods_by_cat.get(c.id, [])
             ],
-        ))
-    return out
+            subcategories=[build(sc) for sc in cats_by_parent.get(c.id, [])],
+        )
+
+    return [build(c) for c in cats_by_parent.get(None, [])]
 
 
 # ---------------------------------------------------------------------------
@@ -498,11 +529,11 @@ def update_order_status(
 # ---------------------------------------------------------------------------
 @app.post("/api/admin/categories", response_model=CategoryOut)
 def create_category(payload: CategoryIn, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
-    c = Category(name=payload.name, icon=payload.icon, sort_order=payload.sort_order)
+    c = Category(name=payload.name, icon=payload.icon, sort_order=payload.sort_order, parent_id=payload.parent_id)
     db.add(c)
     db.commit()
     db.refresh(c)
-    return CategoryOut(id=c.id, name=c.name, icon=c.icon, products=[])
+    return CategoryOut(id=c.id, name=c.name, icon=c.icon, parent_id=c.parent_id, products=[], subcategories=[])
 
 
 @app.patch("/api/admin/categories/{cat_id}", response_model=CategoryOut)
@@ -524,8 +555,12 @@ def update_category(cat_id: int, payload: CategoryIn, admin: User = Depends(requ
 
 @app.delete("/api/admin/categories/{cat_id}")
 def delete_category(cat_id: int, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
-    db.query(Product).filter(Product.category_id == cat_id).delete()
-    db.query(Category).filter(Category.id == cat_id).delete()
+    child_ids = [c.id for c in db.query(Category).filter(Category.parent_id == cat_id).all()]
+    all_ids = [cat_id] + child_ids
+    db.query(Product).filter(Product.category_id.in_(all_ids)).delete(synchronize_session=False)
+    if child_ids:
+        db.query(Category).filter(Category.id.in_(child_ids)).delete(synchronize_session=False)
+    db.query(Category).filter(Category.id == cat_id).delete(synchronize_session=False)
     db.commit()
     return {"ok": True}
 
