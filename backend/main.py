@@ -68,6 +68,8 @@ class User(Base):
     position = Column(String, default="")          # кухня / бар / гостиница / ...
     role = Column(String, default="user")           # admin | user
     is_active = Column(Boolean, default=True)
+    credit_limit = Column(Float, default=0)          # кредитный лимит, выдаётся админом
+    credit_balance = Column(Float, default=0)        # текущий остаток кредита
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -88,6 +90,7 @@ class Product(Base):
     name = Column(String, nullable=False)
     unit = Column(String, default="кг")
     price = Column(Float, default=0)
+    old_price = Column(Float, nullable=True)          # если задана и больше price — показываем скидку
     icon = Column(Text, default="")
     in_stock = Column(Boolean, default=True)
     sort_order = Column(Integer, default=0)
@@ -101,6 +104,8 @@ class Order(Base):
     status = Column(String, default="new")          # new | processing | done | cancelled
     created_at = Column(DateTime, default=datetime.utcnow)
     delivery_time = Column(DateTime, nullable=True)
+    comment = Column(Text, default="")
+    payment_method = Column(String, default="")       # cash | card | credit
     user = relationship("User")
     items = relationship("OrderItem", back_populates="order", cascade="all, delete-orphan")
 
@@ -124,15 +129,30 @@ Base.metadata.create_all(bind=engine)
 def _migrate_schema():
     """Лёгкая миграция для уже существующей базы: добавляет новые колонки,
     если их ещё нет (create_all не трогает уже созданные таблицы)."""
+    statements_sqlite = [
+        "ALTER TABLE categories ADD COLUMN parent_id INTEGER",
+        "ALTER TABLE users ADD COLUMN credit_limit FLOAT DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN credit_balance FLOAT DEFAULT 0",
+        "ALTER TABLE products ADD COLUMN old_price FLOAT",
+        "ALTER TABLE orders ADD COLUMN comment TEXT DEFAULT ''",
+        "ALTER TABLE orders ADD COLUMN payment_method VARCHAR DEFAULT ''",
+    ]
+    statements_pg = [
+        "ALTER TABLE categories ADD COLUMN IF NOT EXISTS parent_id INTEGER",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS credit_limit FLOAT DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS credit_balance FLOAT DEFAULT 0",
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS old_price FLOAT",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS comment TEXT DEFAULT ''",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method VARCHAR DEFAULT ''",
+    ]
+    stmts = statements_sqlite if DATABASE_URL.startswith("sqlite") else statements_pg
     with engine.connect() as conn:
-        try:
-            if DATABASE_URL.startswith("sqlite"):
-                conn.execute(text("ALTER TABLE categories ADD COLUMN parent_id INTEGER"))
-            else:
-                conn.execute(text("ALTER TABLE categories ADD COLUMN IF NOT EXISTS parent_id INTEGER"))
-            conn.commit()
-        except Exception:
-            pass  # колонка уже существует
+        for stmt in stmts:
+            try:
+                conn.execute(text(stmt))
+                conn.commit()
+            except Exception:
+                conn.rollback()  # колонка уже существует
 
 
 _migrate_schema()
@@ -265,6 +285,8 @@ class MeOut(BaseModel):
     restaurant: str
     position: str
     role: str
+    credit_limit: float = 0
+    credit_balance: float = 0
 
 
 class ProductOut(BaseModel):
@@ -272,6 +294,7 @@ class ProductOut(BaseModel):
     name: str
     unit: str
     price: float
+    old_price: Optional[float] = None
     icon: str
     in_stock: bool
 
@@ -297,6 +320,13 @@ class OrderItemIn(BaseModel):
 
 class OrderIn(BaseModel):
     items: List[OrderItemIn]
+    comment: str = ""
+    payment_method: str = ""
+
+
+class OrderUpdateIn(BaseModel):
+    comment: Optional[str] = None
+    payment_method: Optional[str] = None
 
 
 class OrderItemOut(BaseModel):
@@ -319,6 +349,8 @@ class OrderOut(BaseModel):
     position: str
     restaurant: str
     user_name: str
+    comment: str = ""
+    payment_method: str = ""
     items: List[OrderItemOut] = []
 
 
@@ -343,6 +375,7 @@ class ProductIn(BaseModel):
     name: str
     unit: str = "кг"
     price: float = 0
+    old_price: Optional[float] = None
     icon: str = ""
     in_stock: bool = True
     sort_order: int = 0
@@ -355,6 +388,8 @@ class UserIn(BaseModel):
     position: str = ""
     role: str = "user"
     is_active: bool = True
+    credit_limit: float = 0
+    credit_balance: float = 0
 
 
 class UserOut(BaseModel):
@@ -365,6 +400,8 @@ class UserOut(BaseModel):
     position: str
     role: str
     is_active: bool
+    credit_limit: float = 0
+    credit_balance: float = 0
 
     class Config:
         from_attributes = True
@@ -385,6 +422,8 @@ def order_to_out(o: Order) -> OrderOut:
         position=o.user.position if o.user else "",
         restaurant=o.user.restaurant if o.user else "",
         user_name=o.user.name if o.user else "",
+        comment=o.comment or "",
+        payment_method=o.payment_method or "",
         items=[
             OrderItemOut(
                 id=i.id, product_name=i.product_name, unit=i.unit, qty=i.qty,
@@ -430,6 +469,7 @@ def me(user: User = Depends(get_current_user)):
     return MeOut(
         id=user.id, telegram_id=user.telegram_id, name=user.name,
         restaurant=user.restaurant, position=user.position, role=user.role,
+        credit_limit=user.credit_limit or 0, credit_balance=user.credit_balance or 0,
     )
 
 
@@ -453,7 +493,7 @@ def catalog(user: User = Depends(get_current_user), db: Session = Depends(get_db
         return CategoryOut(
             id=c.id, name=c.name, icon=c.icon or "", parent_id=c.parent_id,
             products=[
-                ProductOut(id=p.id, name=p.name, unit=p.unit, price=p.price, icon=p.icon or "", in_stock=p.in_stock)
+                ProductOut(id=p.id, name=p.name, unit=p.unit, price=p.price, old_price=p.old_price, icon=p.icon or "", in_stock=p.in_stock)
                 for p in prods_by_cat.get(c.id, [])
             ],
             subcategories=[build(sc) for sc in cats_by_parent.get(c.id, [])],
@@ -469,7 +509,7 @@ def catalog(user: User = Depends(get_current_user), db: Session = Depends(get_db
 def create_order(payload: OrderIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     if not payload.items:
         raise HTTPException(400, "empty_order")
-    order = Order(user_id=user.id, status="new")
+    order = Order(user_id=user.id, status="new", comment=payload.comment or "", payment_method=payload.payment_method or "")
     db.add(order)
     db.flush()
     for it in payload.items:
@@ -514,13 +554,55 @@ def update_order_item(
 @app.patch("/api/orders/{order_id}/status", response_model=OrderOut)
 def update_order_status(
     order_id: int, payload: OrderStatusIn,
-    admin: User = Depends(require_admin), db: Session = Depends(get_db),
+    user: User = Depends(get_current_user), db: Session = Depends(get_db),
 ):
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
         raise HTTPException(404, "not_found")
+    is_owner = order.user_id == user.id
+    if user.role != "admin":
+        # обычный пользователь может только отменить СВОЙ заказ, и только пока он "new"
+        if not is_owner or payload.status != "cancelled" or order.status != "new":
+            raise HTTPException(403, "admin_only")
     order.status = payload.status
     db.commit()
+    return order_to_out(order)
+
+
+@app.patch("/api/orders/{order_id}", response_model=OrderOut)
+def update_order(
+    order_id: int, payload: OrderUpdateIn,
+    user: User = Depends(get_current_user), db: Session = Depends(get_db),
+):
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order or (user.role != "admin" and order.user_id != user.id):
+        raise HTTPException(404, "not_found")
+    if payload.comment is not None:
+        order.comment = payload.comment
+    if payload.payment_method is not None:
+        order.payment_method = payload.payment_method
+    db.commit()
+    return order_to_out(order)
+
+
+class OrderAddItemIn(BaseModel):
+    name: str
+    unit: str = "кг"
+    qty: float
+    price: float
+
+
+@app.post("/api/orders/{order_id}/items", response_model=OrderOut)
+def add_order_item(
+    order_id: int, payload: OrderAddItemIn,
+    user: User = Depends(get_current_user), db: Session = Depends(get_db),
+):
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order or (user.role != "admin" and order.user_id != user.id):
+        raise HTTPException(404, "not_found")
+    db.add(OrderItem(order_id=order.id, product_name=payload.name, unit=payload.unit, qty=payload.qty, price=payload.price))
+    db.commit()
+    order = db.query(Order).filter(Order.id == order_id).first()
     return order_to_out(order)
 
 
@@ -571,7 +653,7 @@ def create_product(payload: ProductIn, admin: User = Depends(require_admin), db:
     db.add(p)
     db.commit()
     db.refresh(p)
-    return ProductOut(id=p.id, name=p.name, unit=p.unit, price=p.price, icon=p.icon, in_stock=p.in_stock)
+    return ProductOut(id=p.id, name=p.name, unit=p.unit, price=p.price, old_price=p.old_price, icon=p.icon, in_stock=p.in_stock)
 
 
 @app.patch("/api/admin/products/{prod_id}", response_model=ProductOut)
@@ -584,7 +666,7 @@ def update_product(prod_id: int, payload: ProductIn, admin: User = Depends(requi
             continue  # пустую иконку не затираем
         setattr(p, k, v)
     db.commit()
-    return ProductOut(id=p.id, name=p.name, unit=p.unit, price=p.price, icon=p.icon, in_stock=p.in_stock)
+    return ProductOut(id=p.id, name=p.name, unit=p.unit, price=p.price, old_price=p.old_price, icon=p.icon, in_stock=p.in_stock)
 
 
 @app.delete("/api/admin/products/{prod_id}")
@@ -630,3 +712,21 @@ def delete_user(user_id: int, admin: User = Depends(require_admin), db: Session 
     db.query(User).filter(User.id == user_id).delete()
     db.commit()
     return {"ok": True}
+
+
+class UserCreditIn(BaseModel):
+    credit_limit: Optional[float] = None
+    credit_balance: Optional[float] = None
+
+
+@app.patch("/api/admin/users/{user_id}/credit", response_model=UserOut)
+def update_user_credit(user_id: int, payload: UserCreditIn, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    u = db.query(User).filter(User.id == user_id).first()
+    if not u:
+        raise HTTPException(404, "not_found")
+    if payload.credit_limit is not None:
+        u.credit_limit = payload.credit_limit
+    if payload.credit_balance is not None:
+        u.credit_balance = payload.credit_balance
+    db.commit()
+    return u
