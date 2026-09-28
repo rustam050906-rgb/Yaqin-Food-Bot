@@ -499,6 +499,7 @@ class ItemUpdateIn(BaseModel):
     status: Optional[str] = None  # accepted | rejected
     reject_reason: str = ""
     delivered_qty: Optional[float] = None  # фактически принятое количество (может отличаться от заказанного)
+    price: Optional[float] = None  # корректировка цены позиции (только админ)
 
 
 class OrderStatusIn(BaseModel):
@@ -747,6 +748,8 @@ def update_order_item(
         item.reject_reason = payload.reject_reason if payload.status == "rejected" else ""
     if payload.delivered_qty is not None:
         item.delivered_qty = payload.delivered_qty
+    if payload.price is not None and user.role == "admin":
+        item.price = payload.price
     db.commit()
     order = db.query(Order).filter(Order.id == order_id).first()
     return order_to_out(order)
