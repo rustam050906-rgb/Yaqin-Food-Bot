@@ -22,7 +22,7 @@ import hmac
 import hashlib
 from io import BytesIO
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import parse_qsl
 from typing import List, Optional
 
@@ -152,6 +152,31 @@ class OrderItem(Base):
     status = Column(String, default="pending")       # pending | accepted | rejected
     reject_reason = Column(String, default="")
     order = relationship("Order", back_populates="items")
+
+
+class Invoice(Base):
+    __tablename__ = "invoices"
+    id = Column(Integer, primary_key=True)
+    order_id = Column(Integer, ForeignKey("orders.id"), unique=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    amount = Column(Float, default=0)
+    paid_amount = Column(Float, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    order = relationship("Order")
+    user = relationship("User")
+
+
+class Payment(Base):
+    __tablename__ = "payments"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=True)
+    amount = Column(Float, default=0)
+    method = Column(String, default="cash")       # cash | card
+    comment = Column(String, default="")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    user = relationship("User")
+    invoice = relationship("Invoice")
 
 
 Base.metadata.create_all(bind=engine)
@@ -384,6 +409,39 @@ class PromoCheckOut(BaseModel):
     code: str = ""
     discount_percent: Optional[float] = None
     discount_amount: Optional[float] = None
+
+
+class InvoiceOut(BaseModel):
+    id: int
+    order_id: int
+    amount: float
+    paid_amount: float
+    remaining_amount: float
+    status: str  # pending | paid
+    payment_method: str = ""
+    created_at: datetime
+    restaurant: str = ""
+    user_name: str = ""
+
+
+class PaymentIn(BaseModel):
+    user_id: int
+    invoice_id: int
+    amount: float
+    method: str = "cash"
+    comment: str = ""
+
+
+class PaymentOut(BaseModel):
+    id: int
+    user_id: int
+    invoice_id: Optional[int] = None
+    amount: float
+    method: str
+    comment: str = ""
+    created_at: datetime
+    restaurant: str = ""
+    user_name: str = ""
 
 
 class OrderItemIn(BaseModel):
@@ -649,6 +707,8 @@ def create_order(payload: OrderIn, user: User = Depends(get_current_user), db: S
         db.add(OrderItem(order_id=order.id, product_name=it.name, unit=it.unit, qty=it.qty, price=it.price, icon=it.icon or ""))
     if promo:
         promo.used_count = (promo.used_count or 0) + 1
+    order_total = max(subtotal - discount, 0)
+    db.add(Invoice(order_id=order.id, user_id=user.id, amount=order_total, paid_amount=0))
     db.commit()
     db.refresh(order)
     notify_admins_new_order(db, order, user)
@@ -1018,3 +1078,193 @@ def export_orders(admin: User = Depends(require_admin), db: Session = Depends(ge
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ---------------------------------------------------------------------------
+# Инвойсы (создаются автоматически на каждый заказ)
+# ---------------------------------------------------------------------------
+def invoice_to_out(inv: Invoice) -> InvoiceOut:
+    remaining = max((inv.amount or 0) - (inv.paid_amount or 0), 0)
+    status = "paid" if remaining <= 0.01 else "pending"
+    return InvoiceOut(
+        id=inv.id, order_id=inv.order_id, amount=inv.amount or 0, paid_amount=inv.paid_amount or 0,
+        remaining_amount=remaining, status=status,
+        payment_method=inv.order.payment_method if inv.order else "",
+        created_at=inv.created_at,
+        restaurant=inv.user.restaurant if inv.user else "",
+        user_name=inv.user.name if inv.user else "",
+    )
+
+
+@app.get("/api/invoices", response_model=List[InvoiceOut])
+def list_invoices(status: Optional[str] = None, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    q = db.query(Invoice).filter(Invoice.user_id == user.id).order_by(Invoice.created_at.desc())
+    invs = [invoice_to_out(i) for i in q.all()]
+    if status:
+        invs = [i for i in invs if i.status == status]
+    return invs
+
+
+@app.get("/api/admin/invoices", response_model=List[InvoiceOut])
+def admin_list_invoices(
+    user_id: Optional[int] = None, status: Optional[str] = None,
+    admin: User = Depends(require_admin), db: Session = Depends(get_db),
+):
+    q = db.query(Invoice)
+    if user_id:
+        q = q.filter(Invoice.user_id == user_id)
+    q = q.order_by(Invoice.created_at.desc())
+    invs = [invoice_to_out(i) for i in q.all()]
+    if status:
+        invs = [i for i in invs if i.status == status]
+    return invs
+
+
+# ---------------------------------------------------------------------------
+# Платежи (админ вручную отмечает получение оплаты по инвойсу)
+# ---------------------------------------------------------------------------
+def payment_to_out(p: Payment) -> PaymentOut:
+    return PaymentOut(
+        id=p.id, user_id=p.user_id, invoice_id=p.invoice_id, amount=p.amount or 0,
+        method=p.method or "cash", comment=p.comment or "", created_at=p.created_at,
+        restaurant=p.user.restaurant if p.user else "", user_name=p.user.name if p.user else "",
+    )
+
+
+@app.get("/api/payments", response_model=List[PaymentOut])
+def list_payments(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    q = db.query(Payment).filter(Payment.user_id == user.id).order_by(Payment.created_at.desc())
+    return [payment_to_out(p) for p in q.all()]
+
+
+@app.get("/api/admin/payments", response_model=List[PaymentOut])
+def admin_list_payments(user_id: Optional[int] = None, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    q = db.query(Payment)
+    if user_id:
+        q = q.filter(Payment.user_id == user_id)
+    q = q.order_by(Payment.created_at.desc())
+    return [payment_to_out(p) for p in q.all()]
+
+
+@app.post("/api/admin/payments", response_model=PaymentOut)
+def create_payment(payload: PaymentIn, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    inv = db.query(Invoice).filter(Invoice.id == payload.invoice_id, Invoice.user_id == payload.user_id).first()
+    if not inv:
+        raise HTTPException(404, "invoice_not_found")
+    if payload.amount <= 0:
+        raise HTTPException(400, "invalid_amount")
+    remaining = max((inv.amount or 0) - (inv.paid_amount or 0), 0)
+    apply_amount = min(payload.amount, remaining) if remaining > 0 else payload.amount
+    inv.paid_amount = (inv.paid_amount or 0) + apply_amount
+    payment = Payment(
+        user_id=payload.user_id, invoice_id=inv.id, amount=payload.amount,
+        method=payload.method or "cash", comment=payload.comment or "",
+    )
+    db.add(payment)
+    db.commit()
+    db.refresh(payment)
+    return payment_to_out(payment)
+
+
+# ---------------------------------------------------------------------------
+# Мониторинг закупок (для клиента — свои данные, для админа — по любому заведению)
+# ---------------------------------------------------------------------------
+def _top_category_name(cat, cats_by_id):
+    seen = set()
+    while cat and cat.parent_id and cat.id not in seen:
+        seen.add(cat.id)
+        parent = cats_by_id.get(cat.parent_id)
+        if not parent:
+            break
+        cat = parent
+    return cat.name if cat else "Прочее"
+
+
+def _product_category_map(db: Session) -> dict:
+    cats = db.query(Category).all()
+    cats_by_id = {c.id: c for c in cats}
+    prods = db.query(Product).all()
+    return {p.name: _top_category_name(cats_by_id.get(p.category_id), cats_by_id) for p in prods}
+
+
+@app.get("/api/monitoring")
+def monitoring(
+    period: str = "week", user_id: Optional[int] = None,
+    user: User = Depends(get_current_user), db: Session = Depends(get_db),
+):
+    target_id = user.id
+    if user_id and user_id != user.id:
+        if user.role != "admin":
+            raise HTTPException(403, "admin_only")
+        target_id = user_id
+
+    days = {"week": 7, "month": 30}.get(period)
+    now = datetime.utcnow()
+    period_start = now - timedelta(days=days) if days else None
+
+    all_orders = db.query(Order).filter(Order.user_id == target_id, Order.status != "cancelled").all()
+    cur_orders = [o for o in all_orders if not period_start or o.created_at >= period_start]
+    prev_orders = []
+    if period_start:
+        prev_start = period_start - timedelta(days=days)
+        prev_orders = [o for o in all_orders if prev_start <= o.created_at < period_start]
+
+    def order_sum(o):
+        s = sum((i.delivered_qty if i.delivered_qty is not None else i.qty) * i.price for i in o.items if i.status != "rejected")
+        return max(s - (o.discount_amount or 0), 0)
+
+    total_cur = sum(order_sum(o) for o in cur_orders)
+    total_prev = sum(order_sum(o) for o in prev_orders)
+    change_pct = round((total_cur - total_prev) / total_prev * 100, 1) if total_prev > 0 else None
+    avg_purchase = round(total_cur / len(cur_orders), 2) if cur_orders else 0
+
+    method_totals: Counter = Counter()
+    for o in cur_orders:
+        method_totals[o.payment_method or "cash"] += order_sum(o)
+    total_methods = sum(method_totals.values()) or 1
+    cash_pct = round(method_totals.get("cash", 0) / total_methods * 100, 1)
+    card_pct = round(method_totals.get("card", 0) / total_methods * 100, 1)
+    credit_pct = round(method_totals.get("credit", 0) / total_methods * 100, 1)
+
+    invoices = db.query(Invoice).filter(Invoice.user_id == target_id).all()
+    cur_invoices = [i for i in invoices if not period_start or i.created_at >= period_start]
+    paid_total = sum(i.paid_amount or 0 for i in cur_invoices)
+    remaining_total = sum(max((i.amount or 0) - (i.paid_amount or 0), 0) for i in cur_invoices)
+    active_invoices = sum(1 for i in invoices if (i.amount or 0) - (i.paid_amount or 0) > 0.01)
+
+    cat_map = _product_category_map(db)
+    cat_totals: Counter = Counter()
+    for o in cur_orders:
+        for i in o.items:
+            if i.status == "rejected":
+                continue
+            qty = i.delivered_qty if i.delivered_qty is not None else i.qty
+            cat_totals[cat_map.get(i.product_name, "Прочее")] += qty * i.price
+    cat_sum_total = sum(cat_totals.values()) or 1
+    category_breakdown = [
+        {"name": n, "amount": round(v, 2), "pct": round(v / cat_sum_total * 100, 1)}
+        for n, v in cat_totals.most_common(8)
+    ]
+
+    daily: dict = {}
+    for o in cur_orders:
+        d = o.created_at.strftime("%Y-%m-%d")
+        daily[d] = daily.get(d, 0) + order_sum(o)
+    daily_series = [{"date": d, "amount": round(v, 2)} for d, v in sorted(daily.items())]
+
+    target_user = db.query(User).filter(User.id == target_id).first()
+    return {
+        "user_id": target_id,
+        "restaurant": target_user.restaurant if target_user else "",
+        "total_purchases": round(total_cur, 2),
+        "change_pct": change_pct,
+        "avg_purchase": avg_purchase,
+        "cash_pct": cash_pct,
+        "card_pct": card_pct,
+        "credit_pct": credit_pct,
+        "paid_total": round(paid_total, 2),
+        "remaining_total": round(remaining_total, 2),
+        "active_invoices": active_invoices,
+        "category_breakdown": category_breakdown,
+        "daily_series": daily_series,
+    }
