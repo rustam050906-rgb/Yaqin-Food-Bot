@@ -20,13 +20,16 @@ import os
 import json
 import hmac
 import hashlib
+from io import BytesIO
+from collections import Counter
 from datetime import datetime
 from urllib.parse import parse_qsl
 from typing import List, Optional
 
 import httpx
-from fastapi import FastAPI, Depends, HTTPException, Header
+from fastapi import FastAPI, Depends, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from sqlalchemy import (
     create_engine, Column, Integer, String, Boolean, ForeignKey, DateTime, Text, Float
 )
@@ -106,8 +109,34 @@ class Order(Base):
     delivery_time = Column(DateTime, nullable=True)
     comment = Column(Text, default="")
     payment_method = Column(String, default="")       # cash | card | credit
+    delivery_zone_id = Column(Integer, ForeignKey("delivery_zones.id"), nullable=True)
+    delivery_cost = Column(Float, default=0)
+    promo_code = Column(String, default="")
+    discount_amount = Column(Float, default=0)
     user = relationship("User")
     items = relationship("OrderItem", back_populates="order", cascade="all, delete-orphan")
+    delivery_zone = relationship("DeliveryZone")
+
+
+class DeliveryZone(Base):
+    __tablename__ = "delivery_zones"
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False)
+    cost = Column(Float, default=0)
+    sort_order = Column(Integer, default=0)
+    is_active = Column(Boolean, default=True)
+
+
+class PromoCode(Base):
+    __tablename__ = "promo_codes"
+    id = Column(Integer, primary_key=True)
+    code = Column(String, unique=True, nullable=False)
+    discount_percent = Column(Float, nullable=True)
+    discount_amount = Column(Float, nullable=True)
+    first_order_only = Column(Boolean, default=False)
+    is_active = Column(Boolean, default=True)
+    max_uses = Column(Integer, nullable=True)
+    used_count = Column(Integer, default=0)
 
 
 class OrderItem(Base):
@@ -140,6 +169,10 @@ def _migrate_schema():
         "ALTER TABLE orders ADD COLUMN payment_method VARCHAR DEFAULT ''",
         "ALTER TABLE order_items ADD COLUMN icon TEXT DEFAULT ''",
         "ALTER TABLE order_items ADD COLUMN delivered_qty FLOAT",
+        "ALTER TABLE orders ADD COLUMN delivery_zone_id INTEGER",
+        "ALTER TABLE orders ADD COLUMN delivery_cost FLOAT DEFAULT 0",
+        "ALTER TABLE orders ADD COLUMN promo_code VARCHAR DEFAULT ''",
+        "ALTER TABLE orders ADD COLUMN discount_amount FLOAT DEFAULT 0",
     ]
     statements_pg = [
         "ALTER TABLE categories ADD COLUMN IF NOT EXISTS parent_id INTEGER",
@@ -150,6 +183,10 @@ def _migrate_schema():
         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method VARCHAR DEFAULT ''",
         "ALTER TABLE order_items ADD COLUMN IF NOT EXISTS icon TEXT DEFAULT ''",
         "ALTER TABLE order_items ADD COLUMN IF NOT EXISTS delivered_qty FLOAT",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_zone_id INTEGER",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_cost FLOAT DEFAULT 0",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS promo_code VARCHAR DEFAULT ''",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_amount FLOAT DEFAULT 0",
     ]
     stmts = statements_sqlite if DATABASE_URL.startswith("sqlite") else statements_pg
     with engine.connect() as conn:
@@ -235,9 +272,10 @@ def check_telegram_auth(init_data: str) -> Optional[dict]:
 
 def get_current_user(
     x_telegram_init_data: str = Header(default=""),
+    init_data: str = Query(default=""),
     db: Session = Depends(get_db),
 ) -> User:
-    tg_user = check_telegram_auth(x_telegram_init_data)
+    tg_user = check_telegram_auth(x_telegram_init_data or init_data)
     if not tg_user:
         raise HTTPException(401, "invalid_init_data")
     tg_id = str(tg_user["id"])
@@ -317,6 +355,37 @@ class CategoryOut(BaseModel):
 CategoryOut.update_forward_refs()
 
 
+class PromoCodeIn(BaseModel):
+    code: str
+    discount_percent: Optional[float] = None
+    discount_amount: Optional[float] = None
+    first_order_only: bool = False
+    is_active: bool = True
+    max_uses: Optional[int] = None
+
+
+class PromoCodeOut(BaseModel):
+    id: int
+    code: str
+    discount_percent: Optional[float] = None
+    discount_amount: Optional[float] = None
+    first_order_only: bool = False
+    is_active: bool = True
+    max_uses: Optional[int] = None
+    used_count: int = 0
+
+    class Config:
+        from_attributes = True
+
+
+class PromoCheckOut(BaseModel):
+    valid: bool
+    reason: str = ""
+    code: str = ""
+    discount_percent: Optional[float] = None
+    discount_amount: Optional[float] = None
+
+
 class OrderItemIn(BaseModel):
     name: str
     unit: str = "кг"
@@ -330,6 +399,7 @@ class OrderIn(BaseModel):
     comment: str = ""
     payment_method: str = ""
     delivery_time: Optional[str] = None
+    promo_code: Optional[str] = None
 
 
 class OrderUpdateIn(BaseModel):
@@ -354,6 +424,9 @@ class OrderOut(BaseModel):
     status: str
     created_at: datetime
     delivery_time: Optional[datetime] = None
+    subtotal: float = 0
+    discount_amount: float = 0
+    promo_code: str = ""
     total: float
     items_count: int
     position: str
@@ -422,12 +495,17 @@ class UserOut(BaseModel):
 # ХЕЛПЕРЫ
 # ---------------------------------------------------------------------------
 def order_to_out(o: Order) -> OrderOut:
-    total = sum((i.delivered_qty if i.delivered_qty is not None else i.qty) * i.price for i in o.items)
+    subtotal = sum((i.delivered_qty if i.delivered_qty is not None else i.qty) * i.price for i in o.items)
+    discount = o.discount_amount or 0
+    total = max(subtotal - discount, 0)
     return OrderOut(
         id=o.id,
         status=o.status,
         created_at=o.created_at,
         delivery_time=o.delivery_time,
+        subtotal=subtotal,
+        discount_amount=discount,
+        promo_code=o.promo_code or "",
         total=total,
         items_count=len(o.items),
         position=o.user.position if o.user else "",
@@ -444,6 +522,34 @@ def order_to_out(o: Order) -> OrderOut:
             for i in o.items
         ],
     )
+
+
+STATUS_LABELS_RU = {
+    "new": "Новый", "processing": "В обработке", "shipping": "Доставляется",
+    "delivered": "Доставлен", "done": "Выполнен", "cancelled": "Отменён",
+}
+
+
+def _check_promo(db: Session, code: str, user: User, subtotal: float):
+    """Возвращает (promo or None, discount, error_reason)."""
+    if not code:
+        return None, 0, ""
+    promo = db.query(PromoCode).filter(PromoCode.code == code.strip().upper()).first()
+    if not promo or not promo.is_active:
+        return None, 0, "not_found"
+    if promo.max_uses is not None and (promo.used_count or 0) >= promo.max_uses:
+        return None, 0, "limit_reached"
+    if promo.first_order_only:
+        has_orders = db.query(Order).filter(Order.user_id == user.id).count() > 0
+        if has_orders:
+            return None, 0, "first_order_only"
+    discount = 0.0
+    if promo.discount_percent:
+        discount += subtotal * (promo.discount_percent / 100)
+    if promo.discount_amount:
+        discount += promo.discount_amount
+    discount = max(min(discount, subtotal), 0)
+    return promo, discount, ""
 
 
 def notify_admins_new_order(db: Session, order: Order, buyer: User):
@@ -527,14 +633,22 @@ def create_order(payload: OrderIn, user: User = Depends(get_current_user), db: S
             delivery_dt = datetime.fromisoformat(payload.delivery_time.replace("Z", "+00:00"))
         except ValueError:
             delivery_dt = None
+    subtotal = sum(it.qty * it.price for it in payload.items)
+    promo_input = (payload.promo_code or "").strip()
+    promo, discount, promo_error = _check_promo(db, promo_input, user, subtotal)
+    if promo_input and not promo:
+        raise HTTPException(400, f"promo_{promo_error or 'invalid'}")
     order = Order(
         user_id=user.id, status="new", comment=payload.comment or "",
         payment_method=payload.payment_method or "", delivery_time=delivery_dt,
+        promo_code=promo.code if promo else "", discount_amount=discount,
     )
     db.add(order)
     db.flush()
     for it in payload.items:
         db.add(OrderItem(order_id=order.id, product_name=it.name, unit=it.unit, qty=it.qty, price=it.price, icon=it.icon or ""))
+    if promo:
+        promo.used_count = (promo.used_count or 0) + 1
     db.commit()
     db.refresh(order)
     notify_admins_new_order(db, order, user)
@@ -632,6 +746,19 @@ def add_order_item(
     db.commit()
     order = db.query(Order).filter(Order.id == order_id).first()
     return order_to_out(order)
+
+
+@app.get("/api/promo/check", response_model=PromoCheckOut)
+def check_promo(code: str, subtotal: float = 0, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    promo, discount, error = _check_promo(db, (code or "").strip(), user, subtotal)
+    if not promo:
+        reasons = {
+            "not_found": "Промокод не найден",
+            "limit_reached": "Промокод больше не действует",
+            "first_order_only": "Промокод только для первого заказа",
+        }
+        return PromoCheckOut(valid=False, reason=reasons.get(error, "Промокод не найден"))
+    return PromoCheckOut(valid=True, code=promo.code, discount_percent=promo.discount_percent, discount_amount=discount)
 
 
 # ---------------------------------------------------------------------------
@@ -758,3 +885,136 @@ def update_user_credit(user_id: int, payload: UserCreditIn, admin: User = Depend
         u.credit_balance = payload.credit_balance
     db.commit()
     return u
+
+
+# ---------------------------------------------------------------------------
+# Админ: промокоды
+# ---------------------------------------------------------------------------
+@app.get("/api/admin/promocodes", response_model=List[PromoCodeOut])
+def list_promocodes(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    return db.query(PromoCode).order_by(PromoCode.id.desc()).all()
+
+
+@app.post("/api/admin/promocodes", response_model=PromoCodeOut)
+def create_promocode(payload: PromoCodeIn, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    code = payload.code.strip().upper()
+    if not code:
+        raise HTTPException(400, "empty_code")
+    existing = db.query(PromoCode).filter(PromoCode.code == code).first()
+    if existing:
+        raise HTTPException(400, "already_exists")
+    p = PromoCode(
+        code=code, discount_percent=payload.discount_percent, discount_amount=payload.discount_amount,
+        first_order_only=payload.first_order_only, is_active=payload.is_active, max_uses=payload.max_uses,
+    )
+    db.add(p)
+    db.commit()
+    db.refresh(p)
+    return p
+
+
+@app.patch("/api/admin/promocodes/{promo_id}", response_model=PromoCodeOut)
+def update_promocode(promo_id: int, payload: PromoCodeIn, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    p = db.query(PromoCode).filter(PromoCode.id == promo_id).first()
+    if not p:
+        raise HTTPException(404, "not_found")
+    new_code = payload.code.strip().upper()
+    if new_code:
+        p.code = new_code
+    p.discount_percent = payload.discount_percent
+    p.discount_amount = payload.discount_amount
+    p.first_order_only = payload.first_order_only
+    p.is_active = payload.is_active
+    p.max_uses = payload.max_uses
+    db.commit()
+    return p
+
+
+@app.delete("/api/admin/promocodes/{promo_id}")
+def delete_promocode(promo_id: int, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    db.query(PromoCode).filter(PromoCode.id == promo_id).delete()
+    db.commit()
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Админ: статистика
+# ---------------------------------------------------------------------------
+@app.get("/api/admin/stats")
+def admin_stats(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    orders = db.query(Order).filter(Order.status != "cancelled").all()
+    revenue = 0.0
+    products_counter: Counter = Counter()
+    status_counts: Counter = Counter()
+    for o in orders:
+        status_counts[o.status] += 1
+        for i in o.items:
+            if i.status == "rejected":
+                continue
+            qty = i.delivered_qty if i.delivered_qty is not None else i.qty
+            revenue += qty * i.price
+            products_counter[i.product_name] += qty
+        revenue -= (o.discount_amount or 0)
+    order_count = len(orders)
+    avg_check = (revenue / order_count) if order_count else 0
+    top_products = [{"name": n, "qty": round(q, 2)} for n, q in products_counter.most_common(10)]
+    return {
+        "revenue": round(revenue, 2),
+        "order_count": order_count,
+        "avg_check": round(avg_check, 2),
+        "top_products": top_products,
+        "status_counts": dict(status_counts),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Админ: экспорт заказов в Excel
+# ---------------------------------------------------------------------------
+@app.get("/api/admin/orders/export")
+def export_orders(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    import openpyxl
+    from openpyxl.styles import Font
+
+    orders = db.query(Order).order_by(Order.created_at.desc()).all()
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Заказы"
+    headers = [
+        "ID заказа", "Дата", "Заведение", "Клиент", "Должность", "Статус",
+        "Товар", "Кол-во", "Ед.", "Цена", "Сумма", "Промокод", "Скидка", "Оплата", "Комментарий",
+    ]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+
+    for o in orders:
+        buyer = o.user
+        status_ru = STATUS_LABELS_RU.get(o.status, o.status)
+        base_row = [
+            o.id, o.created_at.strftime("%d.%m.%Y %H:%M"),
+            buyer.restaurant if buyer else "", buyer.name if buyer else "", buyer.position if buyer else "",
+            status_ru,
+        ]
+        if not o.items:
+            ws.append(base_row + ["", "", "", "", "", o.promo_code or "", o.discount_amount or 0, o.payment_method or "", o.comment or ""])
+            continue
+        for i in o.items:
+            qty = i.delivered_qty if i.delivered_qty is not None else i.qty
+            ws.append(base_row + [
+                i.product_name, qty, i.unit, i.price, qty * i.price,
+                o.promo_code or "", o.discount_amount or 0, o.payment_method or "", o.comment or "",
+            ])
+
+    for col in ws.columns:
+        length = max((len(str(c.value)) if c.value is not None else 0) for c in col)
+        ws.column_dimensions[col[0].column_letter].width = min(max(length + 2, 10), 40)
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    filename = f"yaqin_orders_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
