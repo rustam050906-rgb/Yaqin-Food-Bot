@@ -539,8 +539,11 @@ def get_order(order_id: int, user: User = Depends(get_current_user), db: Session
 @app.patch("/api/orders/{order_id}/items/{item_id}", response_model=OrderOut)
 def update_order_item(
     order_id: int, item_id: int, payload: ItemUpdateIn,
-    admin: User = Depends(require_admin), db: Session = Depends(get_db),
+    user: User = Depends(get_current_user), db: Session = Depends(get_db),
 ):
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order or (user.role != "admin" and order.user_id != user.id):
+        raise HTTPException(404, "not_found")
     item = db.query(OrderItem).filter(OrderItem.id == item_id, OrderItem.order_id == order_id).first()
     if not item:
         raise HTTPException(404, "not_found")
