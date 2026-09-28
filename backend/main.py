@@ -118,6 +118,8 @@ class OrderItem(Base):
     unit = Column(String, default="кг")
     qty = Column(Float, default=1)
     price = Column(Float, default=0)
+    icon = Column(Text, default="")
+    delivered_qty = Column(Float, nullable=True)      # сколько физически принято; NULL = ещё не скорректировано (= qty)
     status = Column(String, default="pending")       # pending | accepted | rejected
     reject_reason = Column(String, default="")
     order = relationship("Order", back_populates="items")
@@ -136,6 +138,8 @@ def _migrate_schema():
         "ALTER TABLE products ADD COLUMN old_price FLOAT",
         "ALTER TABLE orders ADD COLUMN comment TEXT DEFAULT ''",
         "ALTER TABLE orders ADD COLUMN payment_method VARCHAR DEFAULT ''",
+        "ALTER TABLE order_items ADD COLUMN icon TEXT DEFAULT ''",
+        "ALTER TABLE order_items ADD COLUMN delivered_qty FLOAT",
     ]
     statements_pg = [
         "ALTER TABLE categories ADD COLUMN IF NOT EXISTS parent_id INTEGER",
@@ -144,6 +148,8 @@ def _migrate_schema():
         "ALTER TABLE products ADD COLUMN IF NOT EXISTS old_price FLOAT",
         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS comment TEXT DEFAULT ''",
         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method VARCHAR DEFAULT ''",
+        "ALTER TABLE order_items ADD COLUMN IF NOT EXISTS icon TEXT DEFAULT ''",
+        "ALTER TABLE order_items ADD COLUMN IF NOT EXISTS delivered_qty FLOAT",
     ]
     stmts = statements_sqlite if DATABASE_URL.startswith("sqlite") else statements_pg
     with engine.connect() as conn:
@@ -316,12 +322,14 @@ class OrderItemIn(BaseModel):
     unit: str = "кг"
     qty: float
     price: float
+    icon: str = ""
 
 
 class OrderIn(BaseModel):
     items: List[OrderItemIn]
     comment: str = ""
     payment_method: str = ""
+    delivery_time: Optional[str] = None
 
 
 class OrderUpdateIn(BaseModel):
@@ -335,6 +343,8 @@ class OrderItemOut(BaseModel):
     unit: str
     qty: float
     price: float
+    icon: str = ""
+    delivered_qty: Optional[float] = None
     status: str
     reject_reason: str
 
@@ -355,8 +365,9 @@ class OrderOut(BaseModel):
 
 
 class ItemUpdateIn(BaseModel):
-    status: str  # accepted | rejected
+    status: Optional[str] = None  # accepted | rejected
     reject_reason: str = ""
+    delivered_qty: Optional[float] = None  # фактически принятое количество (может отличаться от заказанного)
 
 
 class OrderStatusIn(BaseModel):
@@ -411,7 +422,7 @@ class UserOut(BaseModel):
 # ХЕЛПЕРЫ
 # ---------------------------------------------------------------------------
 def order_to_out(o: Order) -> OrderOut:
-    total = sum(i.qty * i.price for i in o.items)
+    total = sum((i.delivered_qty if i.delivered_qty is not None else i.qty) * i.price for i in o.items)
     return OrderOut(
         id=o.id,
         status=o.status,
@@ -427,7 +438,8 @@ def order_to_out(o: Order) -> OrderOut:
         items=[
             OrderItemOut(
                 id=i.id, product_name=i.product_name, unit=i.unit, qty=i.qty,
-                price=i.price, status=i.status, reject_reason=i.reject_reason,
+                price=i.price, icon=i.icon or "", delivered_qty=i.delivered_qty,
+                status=i.status, reject_reason=i.reject_reason,
             )
             for i in o.items
         ],
@@ -509,11 +521,20 @@ def catalog(user: User = Depends(get_current_user), db: Session = Depends(get_db
 def create_order(payload: OrderIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     if not payload.items:
         raise HTTPException(400, "empty_order")
-    order = Order(user_id=user.id, status="new", comment=payload.comment or "", payment_method=payload.payment_method or "")
+    delivery_dt = None
+    if payload.delivery_time:
+        try:
+            delivery_dt = datetime.fromisoformat(payload.delivery_time.replace("Z", "+00:00"))
+        except ValueError:
+            delivery_dt = None
+    order = Order(
+        user_id=user.id, status="new", comment=payload.comment or "",
+        payment_method=payload.payment_method or "", delivery_time=delivery_dt,
+    )
     db.add(order)
     db.flush()
     for it in payload.items:
-        db.add(OrderItem(order_id=order.id, product_name=it.name, unit=it.unit, qty=it.qty, price=it.price))
+        db.add(OrderItem(order_id=order.id, product_name=it.name, unit=it.unit, qty=it.qty, price=it.price, icon=it.icon or ""))
     db.commit()
     db.refresh(order)
     notify_admins_new_order(db, order, user)
@@ -547,8 +568,11 @@ def update_order_item(
     item = db.query(OrderItem).filter(OrderItem.id == item_id, OrderItem.order_id == order_id).first()
     if not item:
         raise HTTPException(404, "not_found")
-    item.status = payload.status
-    item.reject_reason = payload.reject_reason if payload.status == "rejected" else ""
+    if payload.status is not None:
+        item.status = payload.status
+        item.reject_reason = payload.reject_reason if payload.status == "rejected" else ""
+    if payload.delivered_qty is not None:
+        item.delivered_qty = payload.delivered_qty
     db.commit()
     order = db.query(Order).filter(Order.id == order_id).first()
     return order_to_out(order)
@@ -593,6 +617,7 @@ class OrderAddItemIn(BaseModel):
     unit: str = "кг"
     qty: float
     price: float
+    icon: str = ""
 
 
 @app.post("/api/orders/{order_id}/items", response_model=OrderOut)
@@ -603,7 +628,7 @@ def add_order_item(
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order or (user.role != "admin" and order.user_id != user.id):
         raise HTTPException(404, "not_found")
-    db.add(OrderItem(order_id=order.id, product_name=payload.name, unit=payload.unit, qty=payload.qty, price=payload.price))
+    db.add(OrderItem(order_id=order.id, product_name=payload.name, unit=payload.unit, qty=payload.qty, price=payload.price, icon=payload.icon or ""))
     db.commit()
     order = db.query(Order).filter(Order.id == order_id).first()
     return order_to_out(order)
