@@ -29,6 +29,7 @@ from typing import List, Optional
 import httpx
 from fastapi import FastAPI, Depends, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy import (
     create_engine, Column, Integer, String, Boolean, ForeignKey, DateTime, Text, Float
@@ -337,6 +338,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Сжимает ответы (в первую очередь /api/catalog с base64-фото) в 4-6 раз —
+# без потери данных, клиент распаковывает прозрачно.
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 
 @app.get("/")
