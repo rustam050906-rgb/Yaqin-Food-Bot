@@ -114,6 +114,7 @@ class Order(Base):
     delivery_cost = Column(Float, default=0)
     promo_code = Column(String, default="")
     discount_amount = Column(Float, default=0)
+    credit_reserved = Column(Float, default=0)   # сумма, списанная с кредитного лимита клиента (payment_method="credit")
     user = relationship("User")
     items = relationship("OrderItem", back_populates="order", cascade="all, delete-orphan")
     delivery_zone = relationship("DeliveryZone")
@@ -199,6 +200,7 @@ def _migrate_schema():
         "ALTER TABLE orders ADD COLUMN delivery_cost FLOAT DEFAULT 0",
         "ALTER TABLE orders ADD COLUMN promo_code VARCHAR DEFAULT ''",
         "ALTER TABLE orders ADD COLUMN discount_amount FLOAT DEFAULT 0",
+        "ALTER TABLE orders ADD COLUMN credit_reserved FLOAT DEFAULT 0",
     ]
     statements_pg = [
         "ALTER TABLE categories ADD COLUMN IF NOT EXISTS parent_id INTEGER",
@@ -213,6 +215,7 @@ def _migrate_schema():
         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_cost FLOAT DEFAULT 0",
         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS promo_code VARCHAR DEFAULT ''",
         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_amount FLOAT DEFAULT 0",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS credit_reserved FLOAT DEFAULT 0",
     ]
     stmts = statements_sqlite if DATABASE_URL.startswith("sqlite") else statements_pg
     with engine.connect() as conn:
@@ -713,6 +716,13 @@ def create_order(payload: OrderIn, user: User = Depends(get_current_user), db: S
     if promo:
         promo.used_count = (promo.used_count or 0) + 1
     order_total = max(subtotal - discount, 0)
+    if (payload.payment_method or "") == "credit":
+        available = (user.credit_balance or 0)
+        if order_total > available:
+            db.rollback()
+            raise HTTPException(400, "insufficient_credit")
+        user.credit_balance = available - order_total
+        order.credit_reserved = order_total
     db.add(Invoice(order_id=order.id, user_id=user.id, amount=order_total, paid_amount=0))
     db.commit()
     db.refresh(order)
@@ -748,8 +758,16 @@ def update_order_item(
     if not item:
         raise HTTPException(404, "not_found")
     if payload.status is not None:
+        was_rejected = item.status == "rejected"
         item.status = payload.status
         item.reject_reason = payload.reject_reason if payload.status == "rejected" else ""
+        # позицию отклонили (и раньше она не была отклонена) — вернуть её сумму на кредитный лимит клиента
+        if payload.status == "rejected" and not was_rejected and order.payment_method == "credit":
+            owner = db.query(User).filter(User.id == order.user_id).first()
+            if owner:
+                item_amount = min((item.qty or 0) * (item.price or 0), order.credit_reserved or 0)
+                order.credit_reserved = max((order.credit_reserved or 0) - item_amount, 0)
+                owner.credit_balance = min((owner.credit_balance or 0) + item_amount, owner.credit_limit or 0)
     if payload.delivered_qty is not None:
         item.delivered_qty = payload.delivered_qty
     if payload.price is not None and user.role == "admin":
@@ -772,7 +790,14 @@ def update_order_status(
         # обычный пользователь может только отменить СВОЙ заказ, и только пока он "new"
         if not is_owner or payload.status != "cancelled" or order.status != "new":
             raise HTTPException(403, "admin_only")
+    was_cancelled = order.status == "cancelled"
     order.status = payload.status
+    # заказ отменили целиком (и раньше он не был отменён) — вернуть остаток кредита клиенту
+    if payload.status == "cancelled" and not was_cancelled and order.payment_method == "credit" and (order.credit_reserved or 0) > 0:
+        owner = db.query(User).filter(User.id == order.user_id).first()
+        if owner:
+            owner.credit_balance = min((owner.credit_balance or 0) + order.credit_reserved, owner.credit_limit or 0)
+        order.credit_reserved = 0
     db.commit()
     return order_to_out(order)
 
@@ -787,8 +812,22 @@ def update_order(
         raise HTTPException(404, "not_found")
     if payload.comment is not None:
         order.comment = payload.comment
-    if payload.payment_method is not None:
-        order.payment_method = payload.payment_method
+    if payload.payment_method is not None and payload.payment_method != order.payment_method:
+        # смена способа оплаты уже после создания заказа — корректно переносим резерв кредита
+        old_method, new_method = order.payment_method, payload.payment_method
+        owner = db.query(User).filter(User.id == order.user_id).first()
+        if old_method == "credit" and (order.credit_reserved or 0) > 0 and owner:
+            owner.credit_balance = min((owner.credit_balance or 0) + order.credit_reserved, owner.credit_limit or 0)
+            order.credit_reserved = 0
+        if new_method == "credit":
+            inv = db.query(Invoice).filter(Invoice.order_id == order.id).first()
+            order_total = max((inv.amount or 0) - (inv.paid_amount or 0), 0) if inv else 0
+            if owner and order_total > (owner.credit_balance or 0):
+                raise HTTPException(400, "insufficient_credit")
+            if owner and order_total > 0:
+                owner.credit_balance = (owner.credit_balance or 0) - order_total
+                order.credit_reserved = order_total
+        order.payment_method = new_method
     db.commit()
     return order_to_out(order)
 
@@ -1163,6 +1202,14 @@ def create_payment(payload: PaymentIn, admin: User = Depends(require_admin), db:
     remaining = max((inv.amount or 0) - (inv.paid_amount or 0), 0)
     apply_amount = min(payload.amount, remaining) if remaining > 0 else payload.amount
     inv.paid_amount = (inv.paid_amount or 0) + apply_amount
+    # оплата по заказу "на перечисление" — списанная ранее сумма кредита возвращается клиенту
+    order = inv.order
+    if order and order.payment_method == "credit" and (order.credit_reserved or 0) > 0:
+        owner = db.query(User).filter(User.id == order.user_id).first()
+        restore_amount = min(apply_amount, order.credit_reserved or 0)
+        if owner and restore_amount > 0:
+            owner.credit_balance = min((owner.credit_balance or 0) + restore_amount, owner.credit_limit or 0)
+            order.credit_reserved = max((order.credit_reserved or 0) - restore_amount, 0)
     payment = Payment(
         user_id=payload.user_id, invoice_id=inv.id, amount=payload.amount,
         method=payload.method or "cash", comment=payload.comment or "",
