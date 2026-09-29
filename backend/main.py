@@ -19,6 +19,7 @@ Yaqin Food — backend API.
 import os
 import json
 import hmac
+import base64
 import hashlib
 from io import BytesIO
 from collections import Counter
@@ -27,10 +28,10 @@ from urllib.parse import parse_qsl
 from typing import List, Optional
 
 import httpx
-from fastapi import FastAPI, Depends, HTTPException, Header, Query
+from fastapi import FastAPI, Depends, HTTPException, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from sqlalchemy import (
     create_engine, Column, Integer, String, Boolean, ForeignKey, DateTime, Text, Float
 )
@@ -658,10 +659,46 @@ def me(user: User = Depends(get_current_user)):
 
 
 # ---------------------------------------------------------------------------
+# Фото категорий/товаров: отдаём НЕ base64-строкой внутри JSON, а отдельной
+# картинкой по ссылке — так браузер/Telegram кэширует её раз и навсегда,
+# а /api/catalog и ответы админки остаются лёгкими и быстрыми.
+# ---------------------------------------------------------------------------
+def public_icon(request: Request, kind: str, obj_id: int, icon: Optional[str]) -> str:
+    """Эмодзи — как есть. Фото (data:...;base64,...) — заменяем на ссылку на /api/image/..."""
+    if icon and icon.startswith("data:"):
+        version = hashlib.md5(icon.encode("utf-8")).hexdigest()[:10]
+        base = str(request.base_url).rstrip("/")
+        return f"{base}/api/image/{kind}/{obj_id}?v={version}"
+    return icon or ""
+
+
+@app.get("/api/image/{kind}/{obj_id}")
+def get_image(kind: str, obj_id: int, db: Session = Depends(get_db)):
+    if kind == "category":
+        obj = db.query(Category).filter(Category.id == obj_id).first()
+    elif kind == "product":
+        obj = db.query(Product).filter(Product.id == obj_id).first()
+    else:
+        raise HTTPException(404, "not_found")
+    if not obj or not obj.icon or not obj.icon.startswith("data:"):
+        raise HTTPException(404, "not_found")
+    try:
+        header, b64data = obj.icon.split(",", 1)
+        mime = header.split(";")[0][len("data:"):] or "image/jpeg"
+        raw = base64.b64decode(b64data)
+    except Exception:
+        raise HTTPException(404, "not_found")
+    return Response(
+        content=raw, media_type=mime,
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
+# ---------------------------------------------------------------------------
 # Каталог (просмотр — любой зарегистрированный пользователь)
 # ---------------------------------------------------------------------------
 @app.get("/api/catalog", response_model=List[CategoryOut])
-def catalog(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def catalog(request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     cats = db.query(Category).order_by(Category.sort_order, Category.id).all()
     prods = db.query(Product).order_by(Product.sort_order, Product.id).all()
 
@@ -675,9 +712,10 @@ def catalog(user: User = Depends(get_current_user), db: Session = Depends(get_db
 
     def build(c: Category) -> CategoryOut:
         return CategoryOut(
-            id=c.id, name=c.name, icon=c.icon or "", parent_id=c.parent_id,
+            id=c.id, name=c.name, icon=public_icon(request, "category", c.id, c.icon), parent_id=c.parent_id,
             products=[
-                ProductOut(id=p.id, name=p.name, unit=p.unit, price=p.price, old_price=p.old_price, icon=p.icon or "", in_stock=p.in_stock)
+                ProductOut(id=p.id, name=p.name, unit=p.unit, price=p.price, old_price=p.old_price,
+                           icon=public_icon(request, "product", p.id, p.icon), in_stock=p.in_stock)
                 for p in prods_by_cat.get(c.id, [])
             ],
             subcategories=[build(sc) for sc in cats_by_parent.get(c.id, [])],
@@ -871,16 +909,16 @@ def check_promo(code: str, subtotal: float = 0, user: User = Depends(get_current
 # Админ: каталог (категории и товары, включая фото-иконки)
 # ---------------------------------------------------------------------------
 @app.post("/api/admin/categories", response_model=CategoryOut)
-def create_category(payload: CategoryIn, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+def create_category(request: Request, payload: CategoryIn, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     c = Category(name=payload.name, icon=payload.icon, sort_order=payload.sort_order, parent_id=payload.parent_id)
     db.add(c)
     db.commit()
     db.refresh(c)
-    return CategoryOut(id=c.id, name=c.name, icon=c.icon, parent_id=c.parent_id, products=[], subcategories=[])
+    return CategoryOut(id=c.id, name=c.name, icon=public_icon(request, "category", c.id, c.icon), parent_id=c.parent_id, products=[], subcategories=[])
 
 
 @app.patch("/api/admin/categories/{cat_id}", response_model=CategoryOut)
-def update_category(cat_id: int, payload: CategoryIn, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+def update_category(request: Request, cat_id: int, payload: CategoryIn, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     c = db.query(Category).filter(Category.id == cat_id).first()
     if not c:
         raise HTTPException(404, "not_found")
@@ -891,8 +929,9 @@ def update_category(cat_id: int, payload: CategoryIn, admin: User = Depends(requ
     db.commit()
     prods = db.query(Product).filter(Product.category_id == c.id).all()
     return CategoryOut(
-        id=c.id, name=c.name, icon=c.icon,
-        products=[ProductOut(id=p.id, name=p.name, unit=p.unit, price=p.price, icon=p.icon, in_stock=p.in_stock) for p in prods],
+        id=c.id, name=c.name, icon=public_icon(request, "category", c.id, c.icon),
+        products=[ProductOut(id=p.id, name=p.name, unit=p.unit, price=p.price,
+                             icon=public_icon(request, "product", p.id, p.icon), in_stock=p.in_stock) for p in prods],
     )
 
 
@@ -909,16 +948,17 @@ def delete_category(cat_id: int, admin: User = Depends(require_admin), db: Sessi
 
 
 @app.post("/api/admin/products", response_model=ProductOut)
-def create_product(payload: ProductIn, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+def create_product(request: Request, payload: ProductIn, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     p = Product(**payload.dict())
     db.add(p)
     db.commit()
     db.refresh(p)
-    return ProductOut(id=p.id, name=p.name, unit=p.unit, price=p.price, old_price=p.old_price, icon=p.icon, in_stock=p.in_stock)
+    return ProductOut(id=p.id, name=p.name, unit=p.unit, price=p.price, old_price=p.old_price,
+                       icon=public_icon(request, "product", p.id, p.icon), in_stock=p.in_stock)
 
 
 @app.patch("/api/admin/products/{prod_id}", response_model=ProductOut)
-def update_product(prod_id: int, payload: ProductIn, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+def update_product(request: Request, prod_id: int, payload: ProductIn, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     p = db.query(Product).filter(Product.id == prod_id).first()
     if not p:
         raise HTTPException(404, "not_found")
@@ -927,7 +967,8 @@ def update_product(prod_id: int, payload: ProductIn, admin: User = Depends(requi
             continue  # пустую иконку не затираем
         setattr(p, k, v)
     db.commit()
-    return ProductOut(id=p.id, name=p.name, unit=p.unit, price=p.price, old_price=p.old_price, icon=p.icon, in_stock=p.in_stock)
+    return ProductOut(id=p.id, name=p.name, unit=p.unit, price=p.price, old_price=p.old_price,
+                       icon=public_icon(request, "product", p.id, p.icon), in_stock=p.in_stock)
 
 
 @app.delete("/api/admin/products/{prod_id}")
