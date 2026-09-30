@@ -23,7 +23,7 @@ import base64
 import hashlib
 from io import BytesIO
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl
 from typing import List, Optional
 
@@ -46,6 +46,15 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./yaqin.db")
 ADMIN_TELEGRAM_IDS = [x.strip() for x in os.environ.get("ADMIN_TELEGRAM_IDS", "").split(",") if x.strip()]
 ADMIN_WEBAPP_URL = os.environ.get("ADMIN_WEBAPP_URL", "")  # ссылка на webapp, для кнопки "Открыть заказ" в уведомлении
+
+
+def as_utc(dt):
+    """Все datetime в БД пишутся как datetime.utcnow() (UTC), но хранятся "наивными"
+    (без пометки часового пояса). Перед отдачей клиенту явно помечаем их как UTC,
+    чтобы браузер сам правильно пересчитал время в часовой пояс пользователя."""
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
 
 if DATABASE_URL.startswith("sqlite"):
     engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
@@ -568,7 +577,9 @@ def order_to_out(o: Order) -> OrderOut:
     return OrderOut(
         id=o.id,
         status=o.status,
-        created_at=o.created_at,
+        created_at=as_utc(o.created_at),
+        # delivery_time клиент выбирает как СВОЁ локальное время (дата+слот в чекауте) и хранится
+        # "как есть", без привязки к UTC — трогать не нужно, иначе сдвинется на часовой пояс.
         delivery_time=o.delivery_time,
         subtotal=subtotal,
         discount_amount=discount,
@@ -1162,7 +1173,7 @@ def export_orders(admin: User = Depends(require_admin), db: Session = Depends(ge
         buyer = o.user
         status_ru = STATUS_LABELS_RU.get(o.status, o.status)
         base_row = [
-            o.id, o.created_at.strftime("%d.%m.%Y %H:%M"),
+            o.id, (o.created_at + timedelta(hours=5)).strftime("%d.%m.%Y %H:%M"),  # UTC -> Ташкент (UTC+5)
             buyer.restaurant if buyer else "", buyer.name if buyer else "", buyer.position if buyer else "",
             status_ru,
         ]
@@ -1201,7 +1212,7 @@ def invoice_to_out(inv: Invoice) -> InvoiceOut:
         id=inv.id, order_id=inv.order_id, amount=inv.amount or 0, paid_amount=inv.paid_amount or 0,
         remaining_amount=remaining, status=status,
         payment_method=inv.order.payment_method if inv.order else "",
-        created_at=inv.created_at,
+        created_at=as_utc(inv.created_at),
         restaurant=inv.user.restaurant if inv.user else "",
         user_name=inv.user.name if inv.user else "",
     )
@@ -1237,7 +1248,7 @@ def admin_list_invoices(
 def payment_to_out(p: Payment) -> PaymentOut:
     return PaymentOut(
         id=p.id, user_id=p.user_id, invoice_id=p.invoice_id, amount=p.amount or 0,
-        method=p.method or "cash", comment=p.comment or "", created_at=p.created_at,
+        method=p.method or "cash", comment=p.comment or "", created_at=as_utc(p.created_at),
         restaurant=p.user.restaurant if p.user else "", user_name=p.user.name if p.user else "",
     )
 
