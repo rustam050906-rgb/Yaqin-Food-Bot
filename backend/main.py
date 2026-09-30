@@ -646,6 +646,27 @@ def notify_admins_new_order(db: Session, order: Order, buyer: User):
             pass  # уведомление не должно ронять создание заказа
 
 
+def notify_client_order_shipping(db: Session, order: Order):
+    """Уведомляем клиента в Telegram, когда его заказ переходит в статус «Доставляется»."""
+    if not BOT_TOKEN:
+        return
+    owner = db.query(User).filter(User.id == order.user_id).first()
+    if not owner or not owner.telegram_id:
+        return
+    text = f"🚚 Ваш заказ #{order.id} доставляется"
+    payload = {"chat_id": owner.telegram_id, "text": text}
+    if ADMIN_WEBAPP_URL:
+        payload["reply_markup"] = json.dumps({
+            "inline_keyboard": [[
+                {"text": "Открыть заказ", "web_app": {"url": f"{ADMIN_WEBAPP_URL}?order={order.id}"}}
+            ]]
+        })
+    try:
+        httpx.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload, timeout=10)
+    except Exception:
+        pass  # уведомление не должно ронять смену статуса
+
+
 # ---------------------------------------------------------------------------
 # /api/me
 # ---------------------------------------------------------------------------
@@ -828,15 +849,18 @@ def update_order_status(
         # обычный пользователь может только отменить СВОЙ заказ, и только пока он "new"
         if not is_owner or payload.status != "cancelled" or order.status != "new":
             raise HTTPException(403, "admin_only")
-    was_cancelled = order.status == "cancelled"
+    was_status = order.status
     order.status = payload.status
     # заказ отменили целиком (и раньше он не был отменён) — вернуть остаток кредита клиенту
-    if payload.status == "cancelled" and not was_cancelled and order.payment_method == "credit" and (order.credit_reserved or 0) > 0:
+    if payload.status == "cancelled" and was_status != "cancelled" and order.payment_method == "credit" and (order.credit_reserved or 0) > 0:
         owner = db.query(User).filter(User.id == order.user_id).first()
         if owner:
             owner.credit_balance = min((owner.credit_balance or 0) + order.credit_reserved, owner.credit_limit or 0)
         order.credit_reserved = 0
     db.commit()
+    # заказ перевели в "Доставляется" (и раньше он не был в этом статусе) — сообщаем клиенту в Telegram
+    if payload.status == "shipping" and was_status != "shipping":
+        notify_client_order_shipping(db, order)
     return order_to_out(order)
 
 
