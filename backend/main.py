@@ -36,7 +36,7 @@ from sqlalchemy import (
     create_engine, Column, Integer, String, Boolean, ForeignKey, DateTime, Text, Float
 )
 from sqlalchemy import text
-from sqlalchemy.orm import sessionmaker, relationship, backref, declarative_base, Session
+from sqlalchemy.orm import sessionmaker, relationship, backref, declarative_base, Session, load_only
 from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
@@ -93,6 +93,12 @@ class Category(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False)
     icon = Column(Text, default="")   # emoji ИЛИ data:image/...;base64,... (фото, загруженное админом)
+    # Лёгкие поля-«двойники» иконки — чтобы обычные списки (каталог, статистика)
+    # НИКОГДА не вычитывали из базы тяжёлую колонку icon целиком (она читается
+    # только в /api/image, по одной штуке, с долгим кэшем в браузере).
+    has_photo = Column(Boolean, default=False)
+    photo_version = Column(String, default="")
+    icon_short = Column(String, default="")   # копия эмодзи, если это не фото
     sort_order = Column(Integer, default=0)
     parent_id = Column(Integer, ForeignKey("categories.id"), nullable=True)  # NULL = категория верхнего уровня, иначе — подкатегория
     children = relationship("Category", backref=backref("parent", remote_side=[id]))
@@ -107,6 +113,9 @@ class Product(Base):
     price = Column(Float, default=0)
     old_price = Column(Float, nullable=True)          # если задана и больше price — показываем скидку
     icon = Column(Text, default="")
+    has_photo = Column(Boolean, default=False)
+    photo_version = Column(String, default="")
+    icon_short = Column(String, default="")
     in_stock = Column(Boolean, default=True)
     sort_order = Column(Integer, default=0)
     category = relationship("Category")
@@ -213,6 +222,12 @@ def _migrate_schema():
         "ALTER TABLE orders ADD COLUMN discount_amount FLOAT DEFAULT 0",
         "ALTER TABLE orders ADD COLUMN credit_reserved FLOAT DEFAULT 0",
         "ALTER TABLE users ADD COLUMN language VARCHAR DEFAULT 'ru'",
+        "ALTER TABLE categories ADD COLUMN has_photo BOOLEAN DEFAULT 0",
+        "ALTER TABLE categories ADD COLUMN photo_version VARCHAR DEFAULT ''",
+        "ALTER TABLE categories ADD COLUMN icon_short VARCHAR DEFAULT ''",
+        "ALTER TABLE products ADD COLUMN has_photo BOOLEAN DEFAULT 0",
+        "ALTER TABLE products ADD COLUMN photo_version VARCHAR DEFAULT ''",
+        "ALTER TABLE products ADD COLUMN icon_short VARCHAR DEFAULT ''",
     ]
     statements_pg = [
         "ALTER TABLE categories ADD COLUMN IF NOT EXISTS parent_id INTEGER",
@@ -229,6 +244,12 @@ def _migrate_schema():
         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_amount FLOAT DEFAULT 0",
         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS credit_reserved FLOAT DEFAULT 0",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS language VARCHAR DEFAULT 'ru'",
+        "ALTER TABLE categories ADD COLUMN IF NOT EXISTS has_photo BOOLEAN DEFAULT false",
+        "ALTER TABLE categories ADD COLUMN IF NOT EXISTS photo_version VARCHAR DEFAULT ''",
+        "ALTER TABLE categories ADD COLUMN IF NOT EXISTS icon_short VARCHAR DEFAULT ''",
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS has_photo BOOLEAN DEFAULT false",
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS photo_version VARCHAR DEFAULT ''",
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS icon_short VARCHAR DEFAULT ''",
     ]
     stmts = statements_sqlite if DATABASE_URL.startswith("sqlite") else statements_pg
     with engine.connect() as conn:
@@ -241,6 +262,38 @@ def _migrate_schema():
 
 
 _migrate_schema()
+
+
+def _backfill_photo_fields():
+    """Разовая миграция данных: у категорий/товаров, заведённых ДО появления
+    полей has_photo/photo_version/icon_short, эти поля ещё пустые. Заполняем их
+    один раз на основе текущего значения icon, чтобы /api/catalog и статистика
+    больше никогда не вычитывали из базы тяжёлое base64-фото целиком — только
+    эти лёгкие поля. Сама колонка icon не трогается и продолжает хранить
+    фото для /api/image."""
+    db = SessionLocal()
+    try:
+        for Model in (Category, Product):
+            rows = db.query(Model).filter(
+                (Model.has_photo == False) & (Model.icon_short == "")  # noqa: E712
+            ).all()
+            changed = False
+            for row in rows:
+                if not row.icon:
+                    continue
+                if row.icon.startswith("data:"):
+                    row.has_photo = True
+                    row.photo_version = hashlib.md5(row.icon.encode("utf-8")).hexdigest()[:10]
+                else:
+                    row.icon_short = row.icon
+                changed = True
+            if changed:
+                db.commit()
+    finally:
+        db.close()
+
+
+_backfill_photo_fields()
 
 
 def _seed_catalog_if_empty():
@@ -264,7 +317,9 @@ def _seed_catalog_if_empty():
             ("Хозтовары и прочее", "🧴", [("Салфетки", "упаковка", 8000), ("Пакеты фасовочные", "упаковка", 10000), ("Моющее средство", "л", 17000)]),
         ]
         for order, (title, icon, items) in enumerate(seed):
-            cat = Category(name=title, icon=icon, sort_order=order)
+            # Стартовые иконки — всегда эмодзи (не фото), поэтому легковесные
+            # поля проставляем здесь же напрямую, без базы данных они не тяжёлые.
+            cat = Category(name=title, icon=icon, icon_short=icon, has_photo=False, sort_order=order)
             db.add(cat)
             db.flush()
             for i_order, (name, unit, price) in enumerate(items):
@@ -739,13 +794,31 @@ def set_my_language(payload: LanguageIn, user: User = Depends(get_current_user),
 # картинкой по ссылке — так браузер/Telegram кэширует её раз и навсегда,
 # а /api/catalog и ответы админки остаются лёгкими и быстрыми.
 # ---------------------------------------------------------------------------
-def public_icon(request: Request, kind: str, obj_id: int, icon: Optional[str]) -> str:
-    """Эмодзи — как есть. Фото (data:...;base64,...) — заменяем на ссылку на /api/image/..."""
-    if icon and icon.startswith("data:"):
-        version = hashlib.md5(icon.encode("utf-8")).hexdigest()[:10]
+def set_icon_fields(obj, icon_value: Optional[str]):
+    """Централизованно обновляет иконку объекта (Category/Product): тяжёлое
+    base64-фото пишется в icon (читается только в /api/image, по одной штуке),
+    а лёгкие поля has_photo/photo_version/icon_short обновляются сразу же —
+    именно их используют обычные списки (каталог, статистика), не трогая icon."""
+    if not icon_value:
+        return
+    obj.icon = icon_value
+    if icon_value.startswith("data:"):
+        obj.has_photo = True
+        obj.photo_version = hashlib.md5(icon_value.encode("utf-8")).hexdigest()[:10]
+        obj.icon_short = ""
+    else:
+        obj.has_photo = False
+        obj.photo_version = ""
+        obj.icon_short = icon_value
+
+
+def public_icon(request: Request, kind: str, obj_id: int, has_photo: bool, photo_version: str, icon_short: Optional[str]) -> str:
+    """Эмодзи (icon_short) — как есть. Фото — ссылка на /api/image/...
+    Работает только с лёгкими полями, НИКОГДА не требует тяжёлой колонки icon."""
+    if has_photo:
         base = str(request.base_url).rstrip("/")
-        return f"{base}/api/image/{kind}/{obj_id}?v={version}"
-    return icon or ""
+        return f"{base}/api/image/{kind}/{obj_id}?v={photo_version}"
+    return icon_short or ""
 
 
 @app.get("/api/image/{kind}/{obj_id}")
@@ -775,8 +848,19 @@ def get_image(kind: str, obj_id: int, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 @app.get("/api/catalog", response_model=List[CategoryOut])
 def catalog(request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    cats = db.query(Category).order_by(Category.sort_order, Category.id).all()
-    prods = db.query(Product).order_by(Product.sort_order, Product.id).all()
+    # load_only — САМОЕ ГЛАВНОЕ место: этот запрос выполняется при каждом
+    # открытии приложения. Без load_only SQLAlchemy тянул бы из базы ещё и
+    # тяжёлую колонку icon (base64-фото) для каждой категории/товара при
+    # КАЖДОМ открытии — именно это и «съедало» месячный лимит трафика Neon.
+    cats = db.query(Category).options(load_only(
+        Category.id, Category.name, Category.sort_order, Category.parent_id,
+        Category.has_photo, Category.photo_version, Category.icon_short,
+    )).order_by(Category.sort_order, Category.id).all()
+    prods = db.query(Product).options(load_only(
+        Product.id, Product.category_id, Product.name, Product.unit, Product.price,
+        Product.old_price, Product.in_stock, Product.sort_order,
+        Product.has_photo, Product.photo_version, Product.icon_short,
+    )).order_by(Product.sort_order, Product.id).all()
 
     prods_by_cat: dict = {}
     for p in prods:
@@ -788,10 +872,13 @@ def catalog(request: Request, user: User = Depends(get_current_user), db: Sessio
 
     def build(c: Category) -> CategoryOut:
         return CategoryOut(
-            id=c.id, name=c.name, icon=public_icon(request, "category", c.id, c.icon), parent_id=c.parent_id,
+            id=c.id, name=c.name,
+            icon=public_icon(request, "category", c.id, c.has_photo, c.photo_version, c.icon_short),
+            parent_id=c.parent_id,
             products=[
                 ProductOut(id=p.id, name=p.name, unit=p.unit, price=p.price, old_price=p.old_price,
-                           icon=public_icon(request, "product", p.id, p.icon), in_stock=p.in_stock)
+                           icon=public_icon(request, "product", p.id, p.has_photo, p.photo_version, p.icon_short),
+                           in_stock=p.in_stock)
                 for p in prods_by_cat.get(c.id, [])
             ],
             subcategories=[build(sc) for sc in cats_by_parent.get(c.id, [])],
@@ -989,11 +1076,13 @@ def check_promo(code: str, subtotal: float = 0, user: User = Depends(get_current
 # ---------------------------------------------------------------------------
 @app.post("/api/admin/categories", response_model=CategoryOut)
 def create_category(request: Request, payload: CategoryIn, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
-    c = Category(name=payload.name, icon=payload.icon, sort_order=payload.sort_order, parent_id=payload.parent_id)
+    c = Category(name=payload.name, sort_order=payload.sort_order, parent_id=payload.parent_id)
+    set_icon_fields(c, payload.icon)
     db.add(c)
     db.commit()
     db.refresh(c)
-    return CategoryOut(id=c.id, name=c.name, icon=public_icon(request, "category", c.id, c.icon), parent_id=c.parent_id, products=[], subcategories=[])
+    return CategoryOut(id=c.id, name=c.name, icon=public_icon(request, "category", c.id, c.has_photo, c.photo_version, c.icon_short),
+                        parent_id=c.parent_id, products=[], subcategories=[])
 
 
 @app.patch("/api/admin/categories/{cat_id}", response_model=CategoryOut)
@@ -1003,14 +1092,18 @@ def update_category(request: Request, cat_id: int, payload: CategoryIn, admin: U
         raise HTTPException(404, "not_found")
     c.name = payload.name
     if payload.icon:
-        c.icon = payload.icon
+        set_icon_fields(c, payload.icon)
     c.sort_order = payload.sort_order
     db.commit()
-    prods = db.query(Product).filter(Product.category_id == c.id).all()
+    prods = db.query(Product).options(load_only(
+        Product.id, Product.name, Product.unit, Product.price, Product.old_price,
+        Product.in_stock, Product.has_photo, Product.photo_version, Product.icon_short,
+    )).filter(Product.category_id == c.id).all()
     return CategoryOut(
-        id=c.id, name=c.name, icon=public_icon(request, "category", c.id, c.icon),
+        id=c.id, name=c.name, icon=public_icon(request, "category", c.id, c.has_photo, c.photo_version, c.icon_short),
         products=[ProductOut(id=p.id, name=p.name, unit=p.unit, price=p.price,
-                             icon=public_icon(request, "product", p.id, p.icon), in_stock=p.in_stock) for p in prods],
+                             icon=public_icon(request, "product", p.id, p.has_photo, p.photo_version, p.icon_short),
+                             in_stock=p.in_stock) for p in prods],
     )
 
 
@@ -1028,12 +1121,15 @@ def delete_category(cat_id: int, admin: User = Depends(require_admin), db: Sessi
 
 @app.post("/api/admin/products", response_model=ProductOut)
 def create_product(request: Request, payload: ProductIn, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
-    p = Product(**payload.dict())
+    data = payload.dict()
+    icon_value = data.pop("icon", "")
+    p = Product(**data)
+    set_icon_fields(p, icon_value)
     db.add(p)
     db.commit()
     db.refresh(p)
     return ProductOut(id=p.id, name=p.name, unit=p.unit, price=p.price, old_price=p.old_price,
-                       icon=public_icon(request, "product", p.id, p.icon), in_stock=p.in_stock)
+                       icon=public_icon(request, "product", p.id, p.has_photo, p.photo_version, p.icon_short), in_stock=p.in_stock)
 
 
 @app.patch("/api/admin/products/{prod_id}", response_model=ProductOut)
@@ -1042,12 +1138,14 @@ def update_product(request: Request, prod_id: int, payload: ProductIn, admin: Us
     if not p:
         raise HTTPException(404, "not_found")
     for k, v in payload.dict().items():
-        if k == "icon" and not v:
-            continue  # пустую иконку не затираем
+        if k == "icon":
+            if v:
+                set_icon_fields(p, v)  # пустую иконку не затираем
+            continue
         setattr(p, k, v)
     db.commit()
     return ProductOut(id=p.id, name=p.name, unit=p.unit, price=p.price, old_price=p.old_price,
-                       icon=public_icon(request, "product", p.id, p.icon), in_stock=p.in_stock)
+                       icon=public_icon(request, "product", p.id, p.has_photo, p.photo_version, p.icon_short), in_stock=p.in_stock)
 
 
 @app.delete("/api/admin/products/{prod_id}")
@@ -1355,9 +1453,10 @@ def _top_category_name(cat, cats_by_id):
 
 
 def _product_category_map(db: Session) -> dict:
-    cats = db.query(Category).all()
+    # load_only — нужны только id/name/parent_id, без тяжёлой колонки icon.
+    cats = db.query(Category).options(load_only(Category.id, Category.name, Category.parent_id)).all()
     cats_by_id = {c.id: c for c in cats}
-    prods = db.query(Product).all()
+    prods = db.query(Product).options(load_only(Product.name, Product.category_id)).all()
     return {p.name: _top_category_name(cats_by_id.get(p.category_id), cats_by_id) for p in prods}
 
 
