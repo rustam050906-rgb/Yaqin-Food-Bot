@@ -84,6 +84,7 @@ class User(Base):
     is_active = Column(Boolean, default=True)
     credit_limit = Column(Float, default=0)          # кредитный лимит, выдаётся админом
     credit_balance = Column(Float, default=0)        # текущий остаток кредита
+    language = Column(String, default="ru")           # ru | uz — язык интерфейса и уведомлений
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -211,6 +212,7 @@ def _migrate_schema():
         "ALTER TABLE orders ADD COLUMN promo_code VARCHAR DEFAULT ''",
         "ALTER TABLE orders ADD COLUMN discount_amount FLOAT DEFAULT 0",
         "ALTER TABLE orders ADD COLUMN credit_reserved FLOAT DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN language VARCHAR DEFAULT 'ru'",
     ]
     statements_pg = [
         "ALTER TABLE categories ADD COLUMN IF NOT EXISTS parent_id INTEGER",
@@ -226,6 +228,7 @@ def _migrate_schema():
         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS promo_code VARCHAR DEFAULT ''",
         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_amount FLOAT DEFAULT 0",
         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS credit_reserved FLOAT DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS language VARCHAR DEFAULT 'ru'",
     ]
     stmts = statements_sqlite if DATABASE_URL.startswith("sqlite") else statements_pg
     with engine.connect() as conn:
@@ -373,6 +376,11 @@ class MeOut(BaseModel):
     role: str
     credit_limit: float = 0
     credit_balance: float = 0
+    language: str = "ru"
+
+
+class LanguageIn(BaseModel):
+    language: str  # "ru" | "uz"
 
 
 class ProductOut(BaseModel):
@@ -562,6 +570,7 @@ class UserOut(BaseModel):
     is_active: bool
     credit_limit: float = 0
     credit_balance: float = 0
+    language: str = "ru"
 
     class Config:
         from_attributes = True
@@ -636,19 +645,32 @@ def notify_admins_new_order(db: Session, order: Order, buyer: User):
     admins = db.query(User).filter(User.role == "admin", User.is_active == True).all()  # noqa: E712
     total = sum(i.qty * i.price for i in order.items)
     lines = "\n".join(f"• {i.product_name} — {i.qty} {i.unit}" for i in order.items)
-    text = (
-        f"🆕 Новый заказ #{order.id}\n"
-        f"Заведение: {buyer.restaurant or '-'}\n"
-        f"От: {buyer.name or '-'} ({buyer.position or '-'})\n\n"
-        f"{lines}\n\n"
-        f"Итого: {total:,.0f} сум".replace(",", " ")
-    )
+    total_str = f"{total:,.0f}".replace(",", " ")
     for a in admins:
+        lang = (a.language or "ru")
+        if lang == "uz":
+            text = (
+                f"🆕 Yangi buyurtma #{order.id}\n"
+                f"Muassasa: {buyer.restaurant or '-'}\n"
+                f"Kimdan: {buyer.name or '-'} ({buyer.position or '-'})\n\n"
+                f"{lines}\n\n"
+                f"Jami: {total_str} so'm"
+            )
+            btn_text = "Buyurtmani ochish"
+        else:
+            text = (
+                f"🆕 Новый заказ #{order.id}\n"
+                f"Заведение: {buyer.restaurant or '-'}\n"
+                f"От: {buyer.name or '-'} ({buyer.position or '-'})\n\n"
+                f"{lines}\n\n"
+                f"Итого: {total_str} сум"
+            )
+            btn_text = "Открыть заказ"
         payload = {"chat_id": a.telegram_id, "text": text}
         if ADMIN_WEBAPP_URL:
             payload["reply_markup"] = json.dumps({
                 "inline_keyboard": [[
-                    {"text": "Открыть заказ", "web_app": {"url": f"{ADMIN_WEBAPP_URL}?order={order.id}"}}
+                    {"text": btn_text, "web_app": {"url": f"{ADMIN_WEBAPP_URL}?order={order.id}"}}
                 ]]
             })
         try:
@@ -664,12 +686,18 @@ def notify_client_order_shipping(db: Session, order: Order):
     owner = db.query(User).filter(User.id == order.user_id).first()
     if not owner or not owner.telegram_id:
         return
-    text = f"🚚 Ваш заказ #{order.id} доставляется"
+    lang = (owner.language or "ru")
+    if lang == "uz":
+        text = f"🚚 Sizning #{order.id}-buyurtmangiz yetkazilmoqda"
+        btn_text = "Buyurtmani ochish"
+    else:
+        text = f"🚚 Ваш заказ #{order.id} доставляется"
+        btn_text = "Открыть заказ"
     payload = {"chat_id": owner.telegram_id, "text": text}
     if ADMIN_WEBAPP_URL:
         payload["reply_markup"] = json.dumps({
             "inline_keyboard": [[
-                {"text": "Открыть заказ", "web_app": {"url": f"{ADMIN_WEBAPP_URL}?order={order.id}"}}
+                {"text": btn_text, "web_app": {"url": f"{ADMIN_WEBAPP_URL}?order={order.id}"}}
             ]]
         })
     try:
@@ -687,6 +715,22 @@ def me(user: User = Depends(get_current_user)):
         id=user.id, telegram_id=user.telegram_id, name=user.name,
         restaurant=user.restaurant, position=user.position, role=user.role,
         credit_limit=user.credit_limit or 0, credit_balance=user.credit_balance or 0,
+        language=user.language or "ru",
+    )
+
+
+@app.patch("/api/me/language", response_model=MeOut)
+def set_my_language(payload: LanguageIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if payload.language not in ("ru", "uz"):
+        raise HTTPException(400, "bad_language")
+    user.language = payload.language
+    db.commit()
+    db.refresh(user)
+    return MeOut(
+        id=user.id, telegram_id=user.telegram_id, name=user.name,
+        restaurant=user.restaurant, position=user.position, role=user.role,
+        credit_limit=user.credit_limit or 0, credit_balance=user.credit_balance or 0,
+        language=user.language or "ru",
     )
 
 
