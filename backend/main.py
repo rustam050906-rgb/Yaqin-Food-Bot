@@ -28,6 +28,7 @@ from urllib.parse import parse_qsl
 from typing import List, Optional
 
 import httpx
+from PIL import Image
 from fastapi import FastAPI, Depends, HTTPException, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -294,6 +295,37 @@ def _backfill_photo_fields():
 
 
 _backfill_photo_fields()
+
+
+def _recompress_photos_if_needed():
+    """Разовая миграция: сжимает уже загруженные фото, которые ещё слишком
+    тяжёлые (например, присланы прямо с телефона в оригинальном разрешении,
+    по 300-400 КБ каждое). После сжатия тот же снимок весит ~50-150 КБ —
+    на бесплатном Render это заметно ускоряет и стабилизирует показ фото
+    в каталоге (раньше часть картинок не успевала загрузиться и показывалась
+    «битой иконкой»). Уже компактные фото (меньше порога) не трогаем."""
+    db = SessionLocal()
+    try:
+        for Model in (Category, Product):
+            rows = db.query(Model).filter(Model.has_photo == True).all()  # noqa: E712
+            changed = False
+            for row in rows:
+                if not row.icon or not row.icon.startswith("data:"):
+                    continue
+                if len(row.icon) < 150_000:  # уже компактное — пропускаем
+                    continue
+                compressed = _compress_data_uri(row.icon)
+                if compressed and compressed != row.icon:
+                    row.icon = compressed
+                    row.photo_version = hashlib.md5(compressed.encode("utf-8")).hexdigest()[:10]
+                    changed = True
+            if changed:
+                db.commit()
+    finally:
+        db.close()
+
+
+_recompress_photos_if_needed()
 
 
 def _seed_catalog_if_empty():
@@ -794,6 +826,31 @@ def set_my_language(payload: LanguageIn, user: User = Depends(get_current_user),
 # картинкой по ссылке — так браузер/Telegram кэширует её раз и навсегда,
 # а /api/catalog и ответы админки остаются лёгкими и быстрыми.
 # ---------------------------------------------------------------------------
+def _compress_data_uri(data_uri: str, max_side: int = 640, quality: int = 82) -> str:
+    """Сжимает фото (data:...;base64,...) под размер карточки в каталоге:
+    уменьшает до max_side по длинной стороне и пересохраняет в JPEG с
+    качеством 82% — на экране телефона разница не видна, а вес падает в
+    разы (обычно с нескольких МБ до 50-150 КБ). Если фото уже маленькое
+    или его не получилось разобрать — возвращает исходную строку как есть,
+    чтобы загрузка фото никогда не ломалась из-за этой оптимизации."""
+    try:
+        header, b64data = data_uri.split(",", 1)
+        raw = base64.b64decode(b64data)
+        img = Image.open(BytesIO(raw))
+        img = img.convert("RGB")  # на случай PNG с прозрачностью и т.п.
+        w, h = img.size
+        scale = min(1.0, max_side / float(max(w, h)))
+        if scale < 1.0:
+            img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        compressed = base64.b64encode(buf.getvalue()).decode("ascii")
+        result = f"data:image/jpeg;base64,{compressed}"
+        return result if len(result) < len(data_uri) else data_uri
+    except Exception:
+        return data_uri
+
+
 def set_icon_fields(obj, icon_value: Optional[str]):
     """Централизованно обновляет иконку объекта (Category/Product): тяжёлое
     base64-фото пишется в icon (читается только в /api/image, по одной штуке),
@@ -801,6 +858,8 @@ def set_icon_fields(obj, icon_value: Optional[str]):
     именно их используют обычные списки (каталог, статистика), не трогая icon."""
     if not icon_value:
         return
+    if icon_value.startswith("data:"):
+        icon_value = _compress_data_uri(icon_value)
     obj.icon = icon_value
     if icon_value.startswith("data:"):
         obj.has_photo = True
