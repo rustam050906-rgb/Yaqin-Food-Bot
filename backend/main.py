@@ -119,6 +119,7 @@ class Product(Base):
     icon_short = Column(String, default="")
     in_stock = Column(Boolean, default=True)
     sort_order = Column(Integer, default=0)
+    supplier_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # кто поставляет этот товар (role="supplier")
     category = relationship("Category")
 
 
@@ -256,6 +257,7 @@ def _migrate_schema():
         "ALTER TABLE products ADD COLUMN has_photo BOOLEAN DEFAULT 0",
         "ALTER TABLE products ADD COLUMN photo_version VARCHAR DEFAULT ''",
         "ALTER TABLE products ADD COLUMN icon_short VARCHAR DEFAULT ''",
+        "ALTER TABLE products ADD COLUMN supplier_id INTEGER",
     ]
     statements_pg = [
         "ALTER TABLE categories ADD COLUMN IF NOT EXISTS parent_id INTEGER",
@@ -278,6 +280,7 @@ def _migrate_schema():
         "ALTER TABLE products ADD COLUMN IF NOT EXISTS has_photo BOOLEAN DEFAULT false",
         "ALTER TABLE products ADD COLUMN IF NOT EXISTS photo_version VARCHAR DEFAULT ''",
         "ALTER TABLE products ADD COLUMN IF NOT EXISTS icon_short VARCHAR DEFAULT ''",
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS supplier_id INTEGER",
     ]
     stmts = statements_sqlite if DATABASE_URL.startswith("sqlite") else statements_pg
     with engine.connect() as conn:
@@ -505,6 +508,7 @@ class ProductOut(BaseModel):
     old_price: Optional[float] = None
     icon: str
     in_stock: bool
+    supplier_id: Optional[int] = None
 
 
 class CategoryOut(BaseModel):
@@ -661,6 +665,7 @@ class ProductIn(BaseModel):
     icon: str = ""
     in_stock: bool = True
     sort_order: int = 0
+    supplier_id: Optional[int] = None
 
 
 class UserIn(BaseModel):
@@ -846,6 +851,57 @@ def notify_admins_cart_activity(db: Session, buyer: User, item_name: str):
             pass  # уведомление не должно ничего ломать
 
 
+def notify_suppliers_new_order(db: Session, order: Order):
+    """Для каждой позиции в заказе смотрим, за каким поставщиком (role="supplier")
+    закреплён этот товар (Product.supplier_id), и шлём ему простое текстовое
+    сообщение в Telegram — без кнопок и без входа в веб-приложение, ему это не
+    нужно. Один поставщик может встречаться в заказе несколько раз — группируем,
+    чтобы прислать одно сообщение со всеми его позициями."""
+    if not BOT_TOKEN:
+        return
+    from collections import defaultdict
+    by_supplier: dict = defaultdict(list)
+    for item in order.items:
+        product = db.query(Product).filter(Product.name == item.product_name).first()
+        if product and product.supplier_id:
+            by_supplier[product.supplier_id].append(item)
+    if not by_supplier:
+        return
+    # Поставщику показываем, что заказ от владельца бизнеса (а не от конкретного
+    # клиента ресторана — поставщику это не нужно и не его дело).
+    sender_name = "Yaqin Food"
+    first_admin = db.query(User).filter(User.role == "admin", User.is_active == True).order_by(User.created_at.asc()).first()
+    if first_admin and first_admin.name:
+        sender_name = first_admin.name
+    delivery_str = ""
+    if order.delivery_time:
+        try:
+            delivery_str = order.delivery_time.strftime("%d.%m, %H:%M")
+        except Exception:
+            delivery_str = ""
+    for supplier_id, items in by_supplier.items():
+        supplier = db.query(User).filter(
+            User.id == supplier_id, User.role == "supplier", User.is_active == True  # noqa: E712
+        ).first()
+        if not supplier or not supplier.telegram_id:
+            continue
+        lang = (supplier.language or "ru")
+        lines = "\n".join(f"• {i.product_name} — {i.qty} {i.unit}" for i in items)
+        if lang == "uz":
+            text = f"🆕 Yangi buyurtma ({sender_name})\n\n{lines}"
+            if delivery_str:
+                text += f"\n\n📅 Yetkazish: {delivery_str}"
+        else:
+            text = f"🆕 Новый заказ от {sender_name}\n\n{lines}"
+            if delivery_str:
+                text += f"\n\n📅 Доставка: {delivery_str}"
+        payload = {"chat_id": supplier.telegram_id, "text": text}
+        try:
+            httpx.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload, timeout=10)
+        except Exception:
+            pass  # уведомление не должно ронять создание заказа
+
+
 # ---------------------------------------------------------------------------
 # /api/me
 # ---------------------------------------------------------------------------
@@ -946,7 +1002,7 @@ def catalog(request: Request, user: User = Depends(get_current_user), db: Sessio
     prods = db.query(Product).options(load_only(
         Product.id, Product.category_id, Product.name, Product.unit, Product.price,
         Product.old_price, Product.in_stock, Product.sort_order,
-        Product.has_photo, Product.photo_version, Product.icon_short,
+        Product.has_photo, Product.photo_version, Product.icon_short, Product.supplier_id,
     )).order_by(Product.sort_order, Product.id).all()
 
     prods_by_cat: dict = {}
@@ -965,7 +1021,7 @@ def catalog(request: Request, user: User = Depends(get_current_user), db: Sessio
             products=[
                 ProductOut(id=p.id, name=p.name, unit=p.unit, price=p.price, old_price=p.old_price,
                            icon=public_icon(request, "product", p.id, p.has_photo, p.photo_version, p.icon_short),
-                           in_stock=p.in_stock)
+                           in_stock=p.in_stock, supplier_id=p.supplier_id)
                 for p in prods_by_cat.get(c.id, [])
             ],
             subcategories=[build(sc) for sc in cats_by_parent.get(c.id, [])],
@@ -1015,6 +1071,7 @@ def create_order(payload: OrderIn, user: User = Depends(get_current_user), db: S
     db.commit()
     db.refresh(order)
     notify_admins_new_order(db, order, user)
+    notify_suppliers_new_order(db, order)
     return order_to_out(order)
 
 
@@ -1221,13 +1278,13 @@ def update_category(request: Request, cat_id: int, payload: CategoryIn, admin: U
     db.commit()
     prods = db.query(Product).options(load_only(
         Product.id, Product.name, Product.unit, Product.price, Product.old_price,
-        Product.in_stock, Product.has_photo, Product.photo_version, Product.icon_short,
+        Product.in_stock, Product.has_photo, Product.photo_version, Product.icon_short, Product.supplier_id,
     )).filter(Product.category_id == c.id).all()
     return CategoryOut(
         id=c.id, name=c.name, icon=public_icon(request, "category", c.id, c.has_photo, c.photo_version, c.icon_short),
         products=[ProductOut(id=p.id, name=p.name, unit=p.unit, price=p.price,
                              icon=public_icon(request, "product", p.id, p.has_photo, p.photo_version, p.icon_short),
-                             in_stock=p.in_stock) for p in prods],
+                             in_stock=p.in_stock, supplier_id=p.supplier_id) for p in prods],
     )
 
 
@@ -1253,7 +1310,8 @@ def create_product(request: Request, payload: ProductIn, admin: User = Depends(r
     db.commit()
     db.refresh(p)
     return ProductOut(id=p.id, name=p.name, unit=p.unit, price=p.price, old_price=p.old_price,
-                       icon=public_icon(request, "product", p.id, p.has_photo, p.photo_version, p.icon_short), in_stock=p.in_stock)
+                       icon=public_icon(request, "product", p.id, p.has_photo, p.photo_version, p.icon_short), in_stock=p.in_stock,
+                       supplier_id=p.supplier_id)
 
 
 @app.patch("/api/admin/products/{prod_id}", response_model=ProductOut)
@@ -1269,7 +1327,8 @@ def update_product(request: Request, prod_id: int, payload: ProductIn, admin: Us
         setattr(p, k, v)
     db.commit()
     return ProductOut(id=p.id, name=p.name, unit=p.unit, price=p.price, old_price=p.old_price,
-                       icon=public_icon(request, "product", p.id, p.has_photo, p.photo_version, p.icon_short), in_stock=p.in_stock)
+                       icon=public_icon(request, "product", p.id, p.has_photo, p.photo_version, p.icon_short), in_stock=p.in_stock,
+                       supplier_id=p.supplier_id)
 
 
 @app.delete("/api/admin/products/{prod_id}")
