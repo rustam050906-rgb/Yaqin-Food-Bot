@@ -760,24 +760,29 @@ def notify_admins_new_order(db: Session, order: Order, buyer: User):
     total = sum(i.qty * i.price for i in order.items)
     lines = "\n".join(f"• {i.product_name} — {i.qty} {i.unit}" for i in order.items)
     total_str = f"{total:,.0f}".replace(",", " ")
+    comment = (order.comment or "").strip()
     for a in admins:
         lang = (a.language or "ru")
         if lang == "uz":
+            comment_line = f"\n\n💬 Izoh: {comment}" if comment else ""
             text = (
                 f"🆕 Yangi buyurtma #{order.id}\n"
                 f"Muassasa: {buyer.restaurant or '-'}\n"
                 f"Kimdan: {buyer.name or '-'} ({buyer.position or '-'})\n\n"
                 f"{lines}\n\n"
                 f"Jami: {total_str} so'm"
+                f"{comment_line}"
             )
             btn_text = "Buyurtmani ochish"
         else:
+            comment_line = f"\n\n💬 Комментарий: {comment}" if comment else ""
             text = (
                 f"🆕 Новый заказ #{order.id}\n"
                 f"Заведение: {buyer.restaurant or '-'}\n"
                 f"От: {buyer.name or '-'} ({buyer.position or '-'})\n\n"
                 f"{lines}\n\n"
                 f"Итого: {total_str} сум"
+                f"{comment_line}"
             )
             btn_text = "Открыть заказ"
         payload = {"chat_id": a.telegram_id, "text": text}
@@ -818,6 +823,27 @@ def notify_client_order_shipping(db: Session, order: Order):
         httpx.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload, timeout=10)
     except Exception:
         pass  # уведомление не должно ронять смену статуса
+
+
+def notify_admins_cart_activity(db: Session, buyer: User, item_name: str):
+    """Уведомляем админов, когда клиент только начал собирать корзину (ещё до
+    оформления заказа) — чтобы было видно интерес клиента пораньше, не дожидаясь
+    финального оформления. Веб-приложение вызывает это один раз за сессию
+    (при первом добавлении товара в пустую корзину), а не на каждый клик."""
+    if not BOT_TOKEN:
+        return
+    admins = db.query(User).filter(User.role == "admin", User.is_active == True).all()  # noqa: E712
+    for a in admins:
+        lang = (a.language or "ru")
+        if lang == "uz":
+            text = f"🛒 {buyer.restaurant or buyer.name or '-'} savatchani to'ldira boshladi: {item_name}"
+        else:
+            text = f"🛒 {buyer.restaurant or buyer.name or '-'} начал собирать корзину: {item_name}"
+        payload = {"chat_id": a.telegram_id, "text": text}
+        try:
+            httpx.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload, timeout=10)
+        except Exception:
+            pass  # уведомление не должно ничего ломать
 
 
 # ---------------------------------------------------------------------------
@@ -1117,6 +1143,43 @@ def add_order_item(
     db.commit()
     order = db.query(Order).filter(Order.id == order_id).first()
     return order_to_out(order)
+
+
+class CartNotifyIn(BaseModel):
+    item_name: str = ""
+
+
+@app.post("/api/cart/notify")
+def cart_notify(payload: CartNotifyIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Клиент только начал собирать корзину (ещё не оформил заказ) — шлём
+    админам короткое уведомление в Telegram, чтобы было видно интерес клиента
+    пораньше. Веб-приложение само ограничивает частоту вызовов (раз за сессию
+    набора корзины), здесь дополнительных проверок не делаем."""
+    notify_admins_cart_activity(db, user, payload.item_name or "товар")
+    return {"ok": True}
+
+
+@app.delete("/api/admin/orders/{order_id}")
+def delete_order(order_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Полное удаление заказа админом — вместе с позициями, инвойсом и
+    платежами по нему. Если под заказ был зарезервирован кредит клиента —
+    сначала возвращаем остаток на баланс, чтобы деньги не «зависли»."""
+    if user.role != "admin":
+        raise HTTPException(403, "admin_only")
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(404, "not_found")
+    if order.payment_method == "credit" and (order.credit_reserved or 0) > 0:
+        owner = db.query(User).filter(User.id == order.user_id).first()
+        if owner:
+            owner.credit_balance = min((owner.credit_balance or 0) + order.credit_reserved, owner.credit_limit or 0)
+    invoice = db.query(Invoice).filter(Invoice.order_id == order.id).first()
+    if invoice:
+        db.query(Payment).filter(Payment.invoice_id == invoice.id).delete()
+        db.delete(invoice)
+    db.delete(order)  # order_items удалятся каскадно (cascade="all, delete-orphan")
+    db.commit()
+    return {"ok": True}
 
 
 @app.get("/api/promo/check", response_model=PromoCheckOut)
