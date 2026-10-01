@@ -205,6 +205,33 @@ class Payment(Base):
 Base.metadata.create_all(bind=engine)
 
 
+def _compress_data_uri(data_uri: str, max_side: int = 640, quality: int = 82) -> str:
+    """Сжимает фото (data:...;base64,...) под размер карточки в каталоге:
+    уменьшает до max_side по длинной стороне и пересохраняет в JPEG с
+    качеством 82% — на экране телефона разница не видна, а вес падает в
+    разы (обычно с нескольких МБ до 50-150 КБ). Если фото уже маленькое
+    или его не получилось разобрать — возвращает исходную строку как есть,
+    чтобы загрузка фото никогда не ломалась из-за этой оптимизации.
+    Объявлена здесь, до миграций — её вызывает одноразовая миграция
+    _recompress_photos_if_needed() сразу при старте приложения."""
+    try:
+        header, b64data = data_uri.split(",", 1)
+        raw = base64.b64decode(b64data)
+        img = Image.open(BytesIO(raw))
+        img = img.convert("RGB")  # на случай PNG с прозрачностью и т.п.
+        w, h = img.size
+        scale = min(1.0, max_side / float(max(w, h)))
+        if scale < 1.0:
+            img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        compressed = base64.b64encode(buf.getvalue()).decode("ascii")
+        result = f"data:image/jpeg;base64,{compressed}"
+        return result if len(result) < len(data_uri) else data_uri
+    except Exception:
+        return data_uri
+
+
 def _migrate_schema():
     """Лёгкая миграция для уже существующей базы: добавляет новые колонки,
     если их ещё нет (create_all не трогает уже созданные таблицы)."""
@@ -826,31 +853,6 @@ def set_my_language(payload: LanguageIn, user: User = Depends(get_current_user),
 # картинкой по ссылке — так браузер/Telegram кэширует её раз и навсегда,
 # а /api/catalog и ответы админки остаются лёгкими и быстрыми.
 # ---------------------------------------------------------------------------
-def _compress_data_uri(data_uri: str, max_side: int = 640, quality: int = 82) -> str:
-    """Сжимает фото (data:...;base64,...) под размер карточки в каталоге:
-    уменьшает до max_side по длинной стороне и пересохраняет в JPEG с
-    качеством 82% — на экране телефона разница не видна, а вес падает в
-    разы (обычно с нескольких МБ до 50-150 КБ). Если фото уже маленькое
-    или его не получилось разобрать — возвращает исходную строку как есть,
-    чтобы загрузка фото никогда не ломалась из-за этой оптимизации."""
-    try:
-        header, b64data = data_uri.split(",", 1)
-        raw = base64.b64decode(b64data)
-        img = Image.open(BytesIO(raw))
-        img = img.convert("RGB")  # на случай PNG с прозрачностью и т.п.
-        w, h = img.size
-        scale = min(1.0, max_side / float(max(w, h)))
-        if scale < 1.0:
-            img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
-        buf = BytesIO()
-        img.save(buf, format="JPEG", quality=quality, optimize=True)
-        compressed = base64.b64encode(buf.getvalue()).decode("ascii")
-        result = f"data:image/jpeg;base64,{compressed}"
-        return result if len(result) < len(data_uri) else data_uri
-    except Exception:
-        return data_uri
-
-
 def set_icon_fields(obj, icon_value: Optional[str]):
     """Централизованно обновляет иконку объекта (Category/Product): тяжёлое
     base64-фото пишется в icon (читается только в /api/image, по одной штуке),
