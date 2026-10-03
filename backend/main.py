@@ -47,6 +47,14 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./yaqin.db")
 ADMIN_TELEGRAM_IDS = [x.strip() for x in os.environ.get("ADMIN_TELEGRAM_IDS", "").split(",") if x.strip()]
 ADMIN_WEBAPP_URL = os.environ.get("ADMIN_WEBAPP_URL", "")  # ссылка на webapp, для кнопки "Открыть заказ" в уведомлении
+# Render принимает запросы внутри себя по обычному http (TLS снимается на их
+# прокси раньше), поэтому request.base_url внутри приложения был бы "http://…",
+# хотя снаружи сайт открывается по https. Если ссылки на фото (/api/image/...)
+# строить из такого base_url, браузер и iPhone блокируют их как "смешанный
+# контент" (http-картинка на https-странице) — именно это ломало фото.
+# RENDER_EXTERNAL_URL Render подставляет сам и он всегда правильный (https),
+# поэтому используем его, если он есть, вместо request.base_url.
+PUBLIC_BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 
 
 def as_utc(dt):
@@ -959,7 +967,7 @@ def public_icon(request: Request, kind: str, obj_id: int, has_photo: bool, photo
     """Эмодзи (icon_short) — как есть. Фото — ссылка на /api/image/...
     Работает только с лёгкими полями, НИКОГДА не требует тяжёлой колонки icon."""
     if has_photo:
-        base = str(request.base_url).rstrip("/")
+        base = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
         return f"{base}/api/image/{kind}/{obj_id}?v={photo_version}"
     return icon_short or ""
 
