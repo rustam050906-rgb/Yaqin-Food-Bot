@@ -965,9 +965,25 @@ def set_icon_fields(obj, icon_value: Optional[str]):
 
 def public_icon(request: Request, kind: str, obj_id: int, has_photo: bool, photo_version: str, icon_short: Optional[str]) -> str:
     """Эмодзи (icon_short) — как есть. Фото — ссылка на /api/image/...
-    Работает только с лёгкими полями, НИКОГДА не требует тяжёлой колонки icon."""
+    Работает только с лёгкими полями, НИКОГДА не требует тяжёлой колонки icon.
+
+    Схему (http/https) и хост для ссылки берём в таком порядке:
+    1. PUBLIC_BASE_URL (переменная RENDER_EXTERNAL_URL) — если задана, самый
+       надёжный вариант;
+    2. заголовок X-Forwarded-Proto/X-Forwarded-Host — его Render ВСЕГДА
+       подставляет на своём прокси, даже если RENDER_EXTERNAL_URL почему-то
+       недоступен приложению;
+    3. request.base_url — запасной вариант для локального запуска без Render.
+    Без шагов 1-2 получался адрес с http:// вместо https://, и браузер
+    (включая Safari на iPhone) блокировал такие картинки как «смешанный
+    контент» — именно это и ломало фото."""
     if has_photo:
-        base = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
+        if PUBLIC_BASE_URL:
+            base = PUBLIC_BASE_URL
+        else:
+            scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
+            host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+            base = f"{scheme}://{host}"
         return f"{base}/api/image/{kind}/{obj_id}?v={photo_version}"
     return icon_short or ""
 
